@@ -9,6 +9,8 @@ import SwiftUI
 import AppKit
 import Combine
 import UniformTypeIdentifiers
+import ModelIO
+import SceneKit
 
 // MARK: - Data Models
 
@@ -149,6 +151,29 @@ struct TileInfo: Identifiable, Equatable {
     }
 }
 
+/// Information about a single lens tile
+struct LensTileInfo: Identifiable, Equatable {
+    let id = UUID()
+    let row: Int
+    let col: Int
+    let widthMM: Double
+    let heightMM: Double
+    var model: MDLAsset?  // The 3D model for this tile
+
+    var name: String {
+        return "Lens_R\(String(format: "%02d", row + 1))_C\(String(format: "%02d", col + 1))"
+    }
+
+    func filename(projectName: String) -> String {
+        return "\(projectName)_\(name).stl"
+    }
+
+    // Custom Equatable implementation
+    static func == (lhs: LensTileInfo, rhs: LensTileInfo) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
 /// Project model
 class Project: ObservableObject {
     @Published var name: String = "Untitled Project"
@@ -163,6 +188,8 @@ class Project: ObservableObject {
     @Published var aspectRatioLocked: Bool = true
     @Published var tileConfiguration = TileConfiguration()
     @Published var tiles: [TileInfo] = []
+    @Published var lensModel: MDLAsset?
+    @Published var lensTiles: [LensTileInfo] = []
 
     // Physical dimensions in inches (computed from pixels and DPI)
     var physicalWidth: Double {
@@ -322,6 +349,85 @@ class Project: ObservableObject {
 
         await MainActor.run {
             tiles = result
+            isProcessing = false
+            processingProgress = 1.0
+        }
+    }
+
+    // MARK: - 3D Model Generation
+
+    func generate3DModel() async {
+        await MainActor.run {
+            isProcessing = true
+            processingProgress = 0.0
+        }
+
+        // Calculate physical dimensions in millimeters
+        let widthMM = physicalWidth * 25.4  // inches to mm
+        let heightMM = physicalHeight * 25.4  // inches to mm
+
+        let result = await LensModelGenerator.generateLensModel(
+            dimensions: CGSize(width: widthMM, height: heightMM),
+            lensParameters: lensParameters,
+            progressCallback: { progress in
+                Task { @MainActor in
+                    self.processingProgress = progress
+                }
+            }
+        )
+
+        await MainActor.run {
+            lensModel = result
+            isProcessing = false
+            processingProgress = 1.0
+        }
+    }
+
+    func generateLensTiles() async {
+        // Must have image tiles generated first
+        guard !tiles.isEmpty else { return }
+
+        await MainActor.run {
+            isProcessing = true
+            processingProgress = 0.0
+        }
+
+        var generatedTiles: [LensTileInfo] = []
+
+        // Generate one lens tile for each image tile
+        for (index, imageTile) in tiles.enumerated() {
+            // Calculate physical dimensions of this tile in millimeters
+            let tileWidthInches = Double(imageTile.rect.width) / Double(outputDPI)
+            let tileHeightInches = Double(imageTile.rect.height) / Double(outputDPI)
+            let tileWidthMM = tileWidthInches * 25.4
+            let tileHeightMM = tileHeightInches * 25.4
+
+            // Generate lens model for this tile
+            let model = await LensModelGenerator.generateLensModel(
+                dimensions: CGSize(width: tileWidthMM, height: tileHeightMM),
+                lensParameters: lensParameters,
+                progressCallback: { tileProgress in
+                    Task { @MainActor in
+                        // Overall progress: current tile index + progress within tile
+                        let overallProgress = (Double(index) + tileProgress) / Double(self.tiles.count)
+                        self.processingProgress = overallProgress
+                    }
+                }
+            )
+
+            let lensTile = LensTileInfo(
+                row: imageTile.row,
+                col: imageTile.col,
+                widthMM: tileWidthMM,
+                heightMM: tileHeightMM,
+                model: model
+            )
+
+            generatedTiles.append(lensTile)
+        }
+
+        await MainActor.run {
+            lensTiles = generatedTiles
             isProcessing = false
             processingProgress = 1.0
         }
@@ -698,6 +804,182 @@ class TileGenerator {
     }
 }
 
+// MARK: - Lens Model Generator
+
+class LensModelGenerator {
+    /// Generate a 3D lenticular lens model matching the interlaced image
+    static func generateLensModel(
+        dimensions: CGSize,  // Physical dimensions in mm
+        lensParameters: LensParameters,
+        progressCallback: @escaping (Double) -> Void
+    ) async -> MDLAsset? {
+        return await Task.detached(priority: .userInitiated) {
+            return await Self.performGeneration(
+                dimensions: dimensions,
+                lensParameters: lensParameters,
+                progressCallback: progressCallback
+            )
+        }.value
+    }
+
+    private static func performGeneration(
+        dimensions: CGSize,
+        lensParameters: LensParameters,
+        progressCallback: @escaping (Double) -> Void
+    ) async -> MDLAsset? {
+        let widthMM = Double(dimensions.width)
+        let heightMM = Double(dimensions.height)
+
+        progressCallback(0.1)
+
+        // Calculate number of lenticules
+        let numLenticules = Int(widthMM / lensParameters.pitch)
+
+        // Create allocator
+        let allocator = MDLMeshBufferDataAllocator()
+
+        // Arrays to hold all vertices and indices
+        var allVertices: [SIMD3<Float>] = []
+        var allNormals: [SIMD3<Float>] = []
+        var allIndices: [UInt32] = []
+
+        progressCallback(0.2)
+
+        // Generate lenticules
+        let segmentsAround = 24  // Resolution around the cylinder arc
+        let segmentsAlong = 2    // Just 2 segments along the length (start and end)
+
+        for i in 0..<numLenticules {
+            let xStart = Float(i) * Float(lensParameters.pitch)
+
+            // Generate vertices for this lenticule (half-cylinder)
+            let baseIndexOffset = UInt32(allVertices.count)
+
+            for segAlong in 0...segmentsAlong {
+                let z = Float(segAlong) * Float(heightMM) / Float(segmentsAlong)
+
+                for segAround in 0...segmentsAround {
+                    // Angle from -π/2 to π/2 (half cylinder facing up)
+                    let angle = Float.pi * (Float(segAround) / Float(segmentsAround) - 0.5)
+
+                    let x = xStart + Float(lensParameters.pitch / 2.0) + Float(lensParameters.radius) * sin(angle)
+                    let y = Float(lensParameters.radius) * cos(angle) - Float(lensParameters.radius) + Float(lensParameters.height)
+
+                    allVertices.append(SIMD3(x, y, z))
+
+                    // Normal for curved surface
+                    let normal = SIMD3(sin(angle), cos(angle), 0)
+                    allNormals.append(normalize(normal))
+                }
+            }
+
+            // Generate triangle indices for this lenticule
+            for segAlong in 0..<segmentsAlong {
+                for segAround in 0..<segmentsAround {
+                    let verticesPerRing = UInt32(segmentsAround + 1)
+
+                    let i0 = baseIndexOffset + UInt32(segAlong) * verticesPerRing + UInt32(segAround)
+                    let i1 = i0 + 1
+                    let i2 = i0 + verticesPerRing
+                    let i3 = i2 + 1
+
+                    // Two triangles per quad
+                    allIndices.append(contentsOf: [i0, i2, i1, i1, i2, i3])
+                }
+            }
+
+            // Update progress
+            if i % 10 == 0 {
+                let progress = 0.2 + 0.6 * (Double(i) / Double(numLenticules))
+                progressCallback(progress)
+                await Task.yield()
+            }
+        }
+
+        progressCallback(0.8)
+
+        // Add flat base plate
+        let baseY = Float(0)
+        let baseVertexOffset = UInt32(allVertices.count)
+
+        // Base corners
+        let baseCorners: [SIMD3<Float>] = [
+            SIMD3(0, baseY, 0),
+            SIMD3(Float(widthMM), baseY, 0),
+            SIMD3(Float(widthMM), baseY, Float(heightMM)),
+            SIMD3(0, baseY, Float(heightMM))
+        ]
+
+        allVertices.append(contentsOf: baseCorners)
+        let baseNormal = SIMD3<Float>(0, -1, 0)
+        for _ in 0..<4 {
+            allNormals.append(baseNormal)
+        }
+
+        // Base triangles
+        allIndices.append(contentsOf: [
+            baseVertexOffset, baseVertexOffset + 1, baseVertexOffset + 2,
+            baseVertexOffset, baseVertexOffset + 2, baseVertexOffset + 3
+        ])
+
+        progressCallback(0.9)
+
+        // Create MDLMesh from vertices and indices
+        let vertexData = Data(bytes: allVertices, count: allVertices.count * MemoryLayout<SIMD3<Float>>.stride)
+        let normalData = Data(bytes: allNormals, count: allNormals.count * MemoryLayout<SIMD3<Float>>.stride)
+        let indexData = Data(bytes: allIndices, count: allIndices.count * MemoryLayout<UInt32>.stride)
+
+        let vertexBuffer = allocator.newBuffer(with: vertexData, type: MDLMeshBufferType.vertex)
+        let normalBuffer = allocator.newBuffer(with: normalData, type: MDLMeshBufferType.vertex)
+        let indexBuffer = allocator.newBuffer(with: indexData, type: MDLMeshBufferType.index)
+
+        let vertexDescriptor = MDLVertexDescriptor()
+        vertexDescriptor.attributes[0] = MDLVertexAttribute(
+            name: MDLVertexAttributePosition,
+            format: .float3,
+            offset: 0,
+            bufferIndex: 0
+        )
+        vertexDescriptor.layouts[0] = MDLVertexBufferLayout(stride: MemoryLayout<SIMD3<Float>>.stride)
+
+        vertexDescriptor.attributes[1] = MDLVertexAttribute(
+            name: MDLVertexAttributeNormal,
+            format: .float3,
+            offset: 0,
+            bufferIndex: 1
+        )
+        vertexDescriptor.layouts[1] = MDLVertexBufferLayout(stride: MemoryLayout<SIMD3<Float>>.stride)
+
+        let submesh = MDLSubmesh(
+            indexBuffer: indexBuffer,
+            indexCount: allIndices.count,
+            indexType: .uInt32,
+            geometryType: .triangles,
+            material: nil
+        )
+
+        let mesh = MDLMesh(
+            vertexBuffers: [vertexBuffer, normalBuffer],
+            vertexCount: allVertices.count,
+            descriptor: vertexDescriptor,
+            submeshes: [submesh]
+        )
+
+        // Create asset
+        let asset = MDLAsset(bufferAllocator: allocator)
+        asset.add(mesh)
+
+        progressCallback(1.0)
+
+        return asset
+    }
+
+    /// Export asset to STL file
+    static func exportSTL(asset: MDLAsset, to url: URL) throws {
+        try asset.export(to: url)
+    }
+}
+
 // MARK: - Navigation sections
 enum NavigationSection: String, CaseIterable, Identifiable {
     case import_ = "Import"
@@ -748,7 +1030,7 @@ struct ContentView: View {
                 case .tiles:
                     TilingView(project: project)
                 case .model3D:
-                    PlaceholderView(title: "3D Model Generation", subtitle: "Coming in Phase 6")
+                    Model3DView(project: project)
                 case .export:
                     PlaceholderView(title: "Export & Print", subtitle: "Coming in Phase 7")
                 }
@@ -2477,6 +2759,405 @@ struct TileThumbnailView: View {
                 if let image = tile.image,
                    let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
                     Text("\(cgImage.width) × \(cgImage.height) px")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(width: 200)
+    }
+}
+
+// MARK: - 3D Model View
+
+struct Model3DView: View {
+    @ObservedObject var project: Project
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            VStack(alignment: .leading, spacing: 8) {
+                Text("3D Lens Model")
+                    .font(.title)
+                Text("Generate a 3D-printable lenticular lens matching your interlaced image.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+
+            Divider()
+
+            if project.interlacedImage == nil {
+                // No interlaced image yet
+                VStack(spacing: 20) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 60))
+                        .foregroundStyle(.orange)
+                    Text("No Interlaced Image")
+                        .font(.title2)
+                    Text("Generate an interlaced image first in the Interlace section.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: 20) {
+                        // Physical dimensions info
+                        VStack(alignment: .leading, spacing: 12) {
+                            Label("Physical Dimensions", systemImage: "ruler")
+                                .font(.headline)
+
+                            HStack(spacing: 40) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Print Size")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("\(String(format: "%.2f", project.physicalWidth))\" × \(String(format: "%.2f", project.physicalHeight))\"")
+                                        .font(.body)
+                                        .fontWeight(.medium)
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Millimeters")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("\(String(format: "%.1f", project.physicalWidth * 25.4)) × \(String(format: "%.1f", project.physicalHeight * 25.4)) mm")
+                                        .font(.body)
+                                        .fontWeight(.medium)
+                                }
+                            }
+                        }
+                        .padding()
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+                        .padding(.top)
+
+                        // Lens parameters summary
+                        VStack(alignment: .leading, spacing: 12) {
+                            Label("Lens Parameters", systemImage: "camera.aperture")
+                                .font(.headline)
+
+                            VStack(spacing: 8) {
+                                parameterRow(label: "LPI", value: String(format: "%.1f", project.lensParameters.lpi))
+                                parameterRow(label: "Pitch", value: String(format: "%.3f mm", project.lensParameters.pitch))
+                                parameterRow(label: "Radius", value: String(format: "%.2f mm", project.lensParameters.radius))
+                                parameterRow(label: "Height", value: String(format: "%.1f mm", project.lensParameters.height))
+
+                                Divider()
+
+                                let widthMM = project.physicalWidth * 25.4
+                                let numLenticules = Int(widthMM / project.lensParameters.pitch)
+                                parameterRow(label: "Lenticules", value: "\(numLenticules)")
+                            }
+                        }
+                        .padding()
+                        .background(Color.orange.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+
+                        // Tiling options
+                        VStack(alignment: .leading, spacing: 12) {
+                            Label("Tiling Options", systemImage: "square.grid.3x3")
+                                .font(.headline)
+
+                            if project.tiles.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("For large prints, generate image tiles first in the Tiles section.")
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                    Text("Then return here to generate matching lens tiles.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(.green)
+                                        Text("\(project.tiles.count) image tiles generated")
+                                            .font(.subheadline)
+                                            .fontWeight(.medium)
+                                    }
+
+                                    Text("Generate matching lens tiles (1:1 correspondence with image tiles)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+
+                                    Button(action: {
+                                        Task {
+                                            await project.generateLensTiles()
+                                        }
+                                    }) {
+                                        Label("Generate Lens Tiles", systemImage: "cube.stack")
+                                            .padding(.horizontal, 20)
+                                            .padding(.vertical, 10)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.green)
+                                    .disabled(project.isProcessing)
+                                }
+                            }
+                        }
+                        .padding()
+                        .background(Color.green.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+
+                        // Progress indicator
+                        if project.isProcessing {
+                            VStack(spacing: 12) {
+                                ProgressView(value: project.processingProgress)
+                                    .progressViewStyle(.linear)
+                                Text("Generating model: \(Int(project.processingProgress * 100))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal)
+                        }
+
+                        // Model info and preview
+                        if let model = project.lensModel {
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Label("Model Generated", systemImage: "checkmark.circle.fill")
+                                        .font(.headline)
+                                        .foregroundStyle(.green)
+
+                                    Spacer()
+
+                                    Button(action: { exportModel(model) }) {
+                                        Label("Export STL", systemImage: "square.and.arrow.up")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+
+                                // Model stats
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if let mesh = model.object(at: 0) as? MDLMesh {
+                                        Text("Vertices: \(mesh.vertexCount)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+
+                                        if let submesh = mesh.submeshes?.firstObject as? MDLSubmesh {
+                                            Text("Triangles: \(submesh.indexCount / 3)")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.gray.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                                // 3D Preview placeholder
+                                VStack(spacing: 12) {
+                                    Image(systemName: "cube.fill")
+                                        .font(.system(size: 80))
+                                        .foregroundStyle(.blue.opacity(0.5))
+                                    Text("3D Model Ready")
+                                        .font(.title3)
+                                        .fontWeight(.medium)
+                                    Text("Export to STL to view in PrusaSlicer or other 3D software")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .multilineTextAlignment(.center)
+                                }
+                                .frame(height: 200)
+                                .frame(maxWidth: .infinity)
+                                .background(Color.gray.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            .padding()
+                            .background(Color.green.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(.horizontal)
+                        }
+
+                        // Lens Tiles Display
+                        if !project.lensTiles.isEmpty {
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Label("\(project.lensTiles.count) Lens Tiles Generated", systemImage: "checkmark.circle.fill")
+                                        .font(.headline)
+                                        .foregroundStyle(.green)
+
+                                    Spacer()
+
+                                    Button(action: { exportAllLensTiles() }) {
+                                        Label("Export All Lens Tiles", systemImage: "square.and.arrow.up")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+                                .padding(.horizontal)
+
+                                Text("Each lens tile corresponds to one image tile. Print and assemble in order.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal)
+
+                                // Lens tiles grid
+                                ScrollView {
+                                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 16)], spacing: 16) {
+                                        ForEach(project.lensTiles) { lensTile in
+                                            LensTileThumbnailView(
+                                                lensTile: lensTile,
+                                                projectName: project.name,
+                                                onExport: { exportSingleLensTile(lensTile) }
+                                            )
+                                        }
+                                    }
+                                    .padding(.horizontal)
+                                }
+                                .frame(maxHeight: 400)
+                            }
+                            .padding(.vertical)
+                            .background(Color.blue.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(.horizontal)
+                        }
+                    }
+                    .padding(.bottom)
+                }
+            }
+        }
+    }
+
+    private func parameterRow(label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+            Spacer()
+            Text(value)
+                .font(.subheadline)
+                .fontWeight(.medium)
+        }
+    }
+
+    private func exportModel(_ model: MDLAsset) {
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [UTType(filenameExtension: "stl")!]
+        savePanel.canCreateDirectories = true
+        savePanel.nameFieldStringValue = "\(project.name)_lens.stl"
+        savePanel.title = "Export 3D Model"
+
+        let response = savePanel.runModal()
+        guard response == .OK, let url = savePanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try LensModelGenerator.exportSTL(asset: model, to: url)
+                print("✅ Successfully exported 3D model to: \(url.path)")
+            } catch {
+                print("❌ Export error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func exportSingleLensTile(_ lensTile: LensTileInfo) {
+        guard let model = lensTile.model else { return }
+
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [UTType(filenameExtension: "stl")!]
+        savePanel.canCreateDirectories = true
+        savePanel.nameFieldStringValue = lensTile.filename(projectName: project.name)
+        savePanel.title = "Export Lens Tile"
+
+        let response = savePanel.runModal()
+        guard response == .OK, let url = savePanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try LensModelGenerator.exportSTL(asset: model, to: url)
+                print("✅ Exported lens tile to: \(url.path)")
+            } catch {
+                print("❌ Export error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func exportAllLensTiles() {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.canCreateDirectories = true
+        openPanel.title = "Choose Export Folder"
+        openPanel.message = "Select a folder to export all lens tiles"
+
+        let response = openPanel.runModal()
+        guard response == .OK, let folderURL = openPanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for lensTile in project.lensTiles {
+                guard let model = lensTile.model else { continue }
+
+                let fileURL = folderURL.appendingPathComponent(lensTile.filename(projectName: project.name))
+
+                do {
+                    try LensModelGenerator.exportSTL(asset: model, to: fileURL)
+                    print("✅ Exported: \(lensTile.name)")
+                } catch {
+                    print("❌ Failed to export \(lensTile.name): \(error.localizedDescription)")
+                }
+            }
+
+            print("✅ All lens tiles exported to: \(folderURL.path)")
+        }
+    }
+}
+
+// MARK: - Lens Tile Thumbnail View
+
+struct LensTileThumbnailView: View {
+    let lensTile: LensTileInfo
+    let projectName: String
+    let onExport: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topTrailing) {
+                // Thumbnail placeholder
+                VStack(spacing: 12) {
+                    Image(systemName: "cube.fill")
+                        .font(.system(size: 60))
+                        .foregroundStyle(.blue.opacity(0.5))
+                    Text(lensTile.name)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                }
+                .frame(height: 150)
+                .frame(maxWidth: .infinity)
+                .background(Color.gray.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                // Export button
+                Button(action: onExport) {
+                    Image(systemName: "square.and.arrow.up.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white, .blue)
+                }
+                .buttonStyle(.plain)
+                .padding(8)
+            }
+
+            // Tile info
+            VStack(alignment: .leading, spacing: 2) {
+                Text(lensTile.name)
+                    .font(.caption)
+                    .fontWeight(.medium)
+
+                Text("\(String(format: "%.1f", lensTile.widthMM)) × \(String(format: "%.1f", lensTile.heightMM)) mm")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                if let model = lensTile.model, let mesh = model.object(at: 0) as? MDLMesh {
+                    Text("\(mesh.vertexCount) vertices")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
