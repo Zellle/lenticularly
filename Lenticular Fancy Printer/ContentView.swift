@@ -129,6 +129,286 @@ struct TileConfiguration: Codable, Equatable {
     static let square8 = TileConfiguration(tileWidth: 8.0, tileHeight: 8.0)
 }
 
+/// Layout strategy for tiling
+enum TileLayoutStrategy: String, Codable, CaseIterable {
+    case portraitRemainderRight = "Portrait, Remainder Right"
+    case portraitRemainderLeft = "Portrait, Remainder Left"
+    case landscapeRemainderBottom = "Landscape, Remainder Bottom"
+    case landscapeRemainderTop = "Landscape, Remainder Top"
+}
+
+/// Printer bed region groups image tiles that will be assembled and printed together
+struct PrinterBedRegion: Codable, Equatable {
+    var columnStart: Int  // Starting column index
+    var columnEnd: Int    // Ending column index (exclusive)
+    var rowStart: Int     // Starting row index
+    var rowEnd: Int       // Ending row index (exclusive)
+}
+
+/// Custom tile layout with boundary positions
+struct TileLayout: Codable, Equatable {
+    var verticalBoundaries: [Double] = []  // X positions in pixels
+    var horizontalBoundaries: [Double] = []  // Y positions in pixels
+    var paperWidth: Double = 8.5  // inches
+    var paperHeight: Double = 11.0  // inches
+    var maxBedSize: Double = 14.0  // inches (Prusa XL with margin)
+    var strategy: TileLayoutStrategy = .portraitRemainderRight
+    var printerBedRegions: [PrinterBedRegion] = []  // Groups of tiles for 3D printing
+
+    // Calculate optimal layout for given image dimensions
+    static func calculateOptimal(
+        imageWidth: Int,
+        imageHeight: Int,
+        dpi: Int,
+        lpi: Double,
+        paperWidth: Double = 8.5,
+        paperHeight: Double = 11.0,
+        maxBedSize: Double = 14.0,
+        strategy: TileLayoutStrategy? = nil
+    ) -> TileLayout {
+        let widthInches = Double(imageWidth) / Double(dpi)
+        let heightInches = Double(imageHeight) / Double(dpi)
+        let pixelsPerLenticule = Double(dpi) / lpi
+
+        // Determine strategy if not provided
+        let selectedStrategy: TileLayoutStrategy
+        if let strategy = strategy {
+            selectedStrategy = strategy
+        } else {
+            // Auto-select best strategy based on fewest cuts
+            let portraitScore = calculateLayoutScore(
+                imageWidth: widthInches,
+                imageHeight: heightInches,
+                paperWidth: paperWidth,
+                paperHeight: paperHeight,
+                maxBedSize: maxBedSize
+            )
+            let landscapeScore = calculateLayoutScore(
+                imageWidth: widthInches,
+                imageHeight: heightInches,
+                paperWidth: paperHeight,
+                paperHeight: paperWidth,
+                maxBedSize: maxBedSize
+            )
+            selectedStrategy = portraitScore.cuts <= landscapeScore.cuts ? .portraitRemainderRight : .landscapeRemainderBottom
+        }
+
+        var layout = TileLayout(
+            paperWidth: paperWidth,
+            paperHeight: paperHeight,
+            maxBedSize: maxBedSize,
+            strategy: selectedStrategy
+        )
+
+        // Determine paper orientation based on strategy
+        let isPortrait = selectedStrategy == .portraitRemainderRight || selectedStrategy == .portraitRemainderLeft
+        let effectivePaperWidth = isPortrait ? paperWidth : paperHeight
+        let effectivePaperHeight = isPortrait ? paperHeight : paperWidth
+
+        // Generate vertical boundaries (columns)
+        var columnBoundaries: [Double] = []
+
+        let minTileWidthInches = 0.5  // Don't create tiles smaller than 0.5 inches
+
+        if selectedStrategy == .portraitRemainderLeft || selectedStrategy == .landscapeRemainderTop {
+            // Generate from right to left (remainder on left)
+            var x: Double = widthInches
+            var iterationCount = 0
+            let maxIterations = 100  // Safety limit
+
+            while x > minTileWidthInches && iterationCount < maxIterations {
+                iterationCount += 1
+                let nextX = max(x - effectivePaperWidth, 0)
+                let pixelX = nextX * Double(dpi)
+
+                // Snap to lenticule boundary
+                let lenticuleCount = round(pixelX / pixelsPerLenticule)
+                let snappedPixelX = lenticuleCount * pixelsPerLenticule
+                let snappedInches = snappedPixelX / Double(dpi)
+
+                // Only add boundary if it leaves at least minTileWidthInches on the left
+                if snappedInches >= minTileWidthInches && snappedPixelX < Double(imageWidth) {
+                    columnBoundaries.insert(snappedPixelX, at: 0)
+                }
+
+                // Make sure we're making progress
+                let newX = snappedPixelX / Double(dpi)
+                if newX >= x {
+                    break  // Prevent infinite loop
+                }
+                x = newX
+            }
+        } else {
+            // Generate from left to right (remainder on right)
+            var x: Double = 0
+            var iterationCount = 0
+            let maxIterations = 100  // Safety limit
+
+            while x < widthInches - minTileWidthInches && iterationCount < maxIterations {
+                iterationCount += 1
+                let nextX = min(x + effectivePaperWidth, widthInches)
+                let pixelX = nextX * Double(dpi)
+
+                // Snap to lenticule boundary
+                let lenticuleCount = round(pixelX / pixelsPerLenticule)
+                let snappedPixelX = lenticuleCount * pixelsPerLenticule
+
+                // Check if remaining space would be too small
+                let remainingInches = widthInches - (snappedPixelX / Double(dpi))
+
+                // Only add boundary if it leaves at least minTileWidthInches remaining OR we're at the end
+                if remainingInches >= minTileWidthInches && snappedPixelX < Double(imageWidth) {
+                    columnBoundaries.append(snappedPixelX)
+                }
+
+                let newX = snappedPixelX / Double(dpi)
+                if newX <= x {
+                    break  // Prevent infinite loop
+                }
+                x = newX
+            }
+        }
+
+        layout.verticalBoundaries = columnBoundaries
+
+        // Generate horizontal boundaries (rows)
+        let minTileHeightInches = 0.5  // Don't create tiles smaller than 0.5 inches
+        var y: Double = 0
+        while y < heightInches - minTileHeightInches {
+            let nextY = min(y + effectivePaperHeight, heightInches)
+            let pixelY = nextY * Double(dpi)
+
+            // Check if remaining space would be too small
+            let remainingInches = heightInches - (pixelY / Double(dpi))
+
+            // Only add boundary if it leaves at least minTileHeightInches remaining
+            if remainingInches >= minTileHeightInches && pixelY < Double(imageHeight) {
+                layout.horizontalBoundaries.append(pixelY)
+            }
+
+            y = nextY
+        }
+
+        // Calculate printer bed regions
+        layout.printerBedRegions = calculatePrinterBedRegions(
+            verticalBoundaries: layout.verticalBoundaries,
+            horizontalBoundaries: layout.horizontalBoundaries,
+            imageWidth: imageWidth,
+            imageHeight: imageHeight,
+            dpi: dpi,
+            maxBedSize: maxBedSize
+        )
+
+        return layout
+    }
+
+    // Calculate which image tile columns/rows combine into printer bed regions
+    private static func calculatePrinterBedRegions(
+        verticalBoundaries: [Double],
+        horizontalBoundaries: [Double],
+        imageWidth: Int,
+        imageHeight: Int,
+        dpi: Int,
+        maxBedSize: Double
+    ) -> [PrinterBedRegion] {
+        let xBoundaries = [0.0] + verticalBoundaries + [Double(imageWidth)]
+        let yBoundaries = [0.0] + horizontalBoundaries + [Double(imageHeight)]
+
+        var regions: [PrinterBedRegion] = []
+        let maxBedPixels = maxBedSize * Double(dpi)
+
+        // Safety check
+        guard xBoundaries.count >= 2 && yBoundaries.count >= 2 else {
+            return []
+        }
+
+        // Group columns that fit together on one printer bed
+        var colStart = 0
+        var colIterations = 0
+        while colStart < xBoundaries.count - 1 && colIterations < 100 {
+            colIterations += 1
+            var colEnd = colStart + 1
+
+            // Try to add more columns while they fit on the bed
+            while colEnd < xBoundaries.count - 1 {
+                let totalWidth = xBoundaries[colEnd + 1] - xBoundaries[colStart]
+                if totalWidth <= maxBedPixels {
+                    colEnd += 1
+                } else {
+                    break
+                }
+            }
+
+            // For this column group, check if all rows fit or need to be split
+            let totalHeight = Double(imageHeight)
+            if totalHeight <= maxBedPixels {
+                // All rows fit on one bed
+                regions.append(PrinterBedRegion(
+                    columnStart: colStart,
+                    columnEnd: colEnd,
+                    rowStart: 0,
+                    rowEnd: yBoundaries.count - 1
+                ))
+            } else {
+                // Split into multiple row groups
+                var rowStart = 0
+                var rowIterations = 0
+                while rowStart < yBoundaries.count - 1 && rowIterations < 100 {
+                    rowIterations += 1
+                    var rowEnd = rowStart + 1
+
+                    while rowEnd < yBoundaries.count - 1 {
+                        let totalRowHeight = yBoundaries[rowEnd + 1] - yBoundaries[rowStart]
+                        if totalRowHeight <= maxBedPixels {
+                            rowEnd += 1
+                        } else {
+                            break
+                        }
+                    }
+
+                    regions.append(PrinterBedRegion(
+                        columnStart: colStart,
+                        columnEnd: colEnd,
+                        rowStart: rowStart,
+                        rowEnd: rowEnd
+                    ))
+
+                    rowStart = rowEnd
+                }
+            }
+
+            colStart = colEnd
+        }
+
+        return regions
+    }
+
+    private static func calculateLayoutScore(
+        imageWidth: Double,
+        imageHeight: Double,
+        paperWidth: Double,
+        paperHeight: Double,
+        maxBedSize: Double
+    ) -> (cuts: Int, tiles: Int, papers: Int) {
+        let cols = Int(ceil(imageWidth / paperWidth))
+        let rows = Int(ceil(imageHeight / paperHeight))
+
+        // Calculate cuts needed
+        var cuts = 0
+        if imageWidth.truncatingRemainder(dividingBy: paperWidth) > 0.1 {
+            cuts += rows  // Vertical cuts for remainder column
+        }
+        if imageHeight.truncatingRemainder(dividingBy: paperHeight) > 0.1 {
+            cuts += cols  // Horizontal cuts for remainder row
+        }
+
+        let totalPapers = cols * rows
+        let tiles = cols  // Stacks combine vertically or horizontally
+
+        return (cuts, tiles, totalPapers)
+    }
+}
+
 /// Information about a single tile
 struct TileInfo: Identifiable, Equatable {
     let id = UUID()
@@ -159,13 +439,29 @@ struct LensTileInfo: Identifiable, Equatable {
     let widthMM: Double
     let heightMM: Double
     var model: MDLAsset?  // The 3D model for this tile
+    let regionIndex: Int?  // Printer bed region index (if using regions)
+    var alignmentFrame: MDLAsset?  // Optional alignment frame for paper positioning
 
     var name: String {
+        if let regionIndex = regionIndex {
+            return "Lens_Bed\(String(format: "%02d", regionIndex + 1))"
+        }
         return "Lens_R\(String(format: "%02d", row + 1))_C\(String(format: "%02d", col + 1))"
+    }
+
+    var frameName: String {
+        if let regionIndex = regionIndex {
+            return "AlignmentFrame_Bed\(String(format: "%02d", regionIndex + 1))"
+        }
+        return "AlignmentFrame_R\(String(format: "%02d", row + 1))_C\(String(format: "%02d", col + 1))"
     }
 
     func filename(projectName: String) -> String {
         return "\(projectName)_\(name).stl"
+    }
+
+    func frameFilename(projectName: String) -> String {
+        return "\(projectName)_\(frameName).stl"
     }
 
     // Custom Equatable implementation
@@ -187,6 +483,7 @@ class Project: ObservableObject {
     @Published var outputHeight: Int = 0
     @Published var aspectRatioLocked: Bool = true
     @Published var tileConfiguration = TileConfiguration()
+    @Published var tileLayout: TileLayout?
     @Published var tiles: [TileInfo] = []
     @Published var lensModel: MDLAsset?
     @Published var lensTiles: [LensTileInfo] = []
@@ -326,6 +623,32 @@ class Project: ObservableObject {
 
     // MARK: - Tiling
 
+    func calculateOptimalLayout(strategy: TileLayoutStrategy? = nil) {
+        guard outputWidth > 0 && outputHeight > 0 else { return }
+
+        tileLayout = TileLayout.calculateOptimal(
+            imageWidth: outputWidth,
+            imageHeight: outputHeight,
+            dpi: outputDPI,
+            lpi: lensParameters.lpi,
+            paperWidth: tileConfiguration.tileWidth,
+            paperHeight: tileConfiguration.tileHeight,
+            maxBedSize: 14.0,
+            strategy: strategy
+        )
+    }
+
+    func calculateNextLayoutStrategy() {
+        guard let currentLayout = tileLayout else { return }
+        let currentStrategy = currentLayout.strategy
+        let allStrategies = TileLayoutStrategy.allCases
+        let currentIndex = allStrategies.firstIndex(of: currentStrategy) ?? 0
+        let nextIndex = (currentIndex + 1) % allStrategies.count
+        let nextStrategy = allStrategies[nextIndex]
+
+        calculateOptimalLayout(strategy: nextStrategy)
+    }
+
     func generateTiles() async {
         guard let interlacedImage = interlacedImage else { return }
 
@@ -336,6 +659,7 @@ class Project: ObservableObject {
 
         let result = await TileGenerator.generateTiles(
             from: interlacedImage,
+            layout: tileLayout,
             config: tileConfiguration,
             lensParameters: lensParameters,
             dpi: outputDPI,
@@ -384,8 +708,9 @@ class Project: ObservableObject {
     }
 
     func generateLensTiles() async {
-        // Must have image tiles generated first
+        // Must have image tiles and layout generated first
         guard !tiles.isEmpty else { return }
+        guard let layout = tileLayout else { return }
 
         await MainActor.run {
             isProcessing = true
@@ -394,33 +719,61 @@ class Project: ObservableObject {
 
         var generatedTiles: [LensTileInfo] = []
 
-        // Generate one lens tile for each image tile
-        for (index, imageTile) in tiles.enumerated() {
-            // Calculate physical dimensions of this tile in millimeters
-            let tileWidthInches = Double(imageTile.rect.width) / Double(outputDPI)
-            let tileHeightInches = Double(imageTile.rect.height) / Double(outputDPI)
-            let tileWidthMM = tileWidthInches * 25.4
-            let tileHeightMM = tileHeightInches * 25.4
+        // Generate one lens tile for each PRINTER BED REGION (not per image tile)
+        // Each region combines multiple image tiles that will be assembled together
+        for (regionIndex, region) in layout.printerBedRegions.enumerated() {
+            // Calculate the pixel boundaries for this region
+            let xBoundaries = [0.0] + layout.verticalBoundaries + [Double(outputWidth)]
+            let yBoundaries = [0.0] + layout.horizontalBoundaries + [Double(outputHeight)]
 
-            // Generate lens model for this tile
+            let regionX1 = xBoundaries[region.columnStart]
+            let regionX2 = xBoundaries[region.columnEnd]
+            let regionY1 = yBoundaries[region.rowStart]
+            let regionY2 = yBoundaries[region.rowEnd]
+
+            let regionWidthPixels = regionX2 - regionX1
+            let regionHeightPixels = regionY2 - regionY1
+
+            // Convert to physical dimensions in millimeters
+            let regionWidthInches = regionWidthPixels / Double(outputDPI)
+            let regionHeightInches = regionHeightPixels / Double(outputDPI)
+            let regionWidthMM = regionWidthInches * 25.4
+            let regionHeightMM = regionHeightInches * 25.4
+
+            // Generate lens model for this entire printer bed region
             let model = await LensModelGenerator.generateLensModel(
-                dimensions: CGSize(width: tileWidthMM, height: tileHeightMM),
+                dimensions: CGSize(width: regionWidthMM, height: regionHeightMM),
                 lensParameters: lensParameters,
-                progressCallback: { tileProgress in
+                progressCallback: { regionProgress in
                     Task { @MainActor in
-                        // Overall progress: current tile index + progress within tile
-                        let overallProgress = (Double(index) + tileProgress) / Double(self.tiles.count)
+                        // Overall progress: current region + progress within region (50% for lens, 50% for frame)
+                        let overallProgress = (Double(regionIndex) + regionProgress * 0.5) / Double(layout.printerBedRegions.count)
                         self.processingProgress = overallProgress
                     }
                 }
             )
 
+            // Generate alignment frame for this region
+            let alignmentFrame = LensModelGenerator.generateAlignmentFrame(
+                dimensions: CGSize(width: regionWidthMM, height: regionHeightMM),
+                frameWidth: 2.5,  // 2.5mm wide frame strips
+                frameHeight: 0.3  // 0.3mm tall (one layer)
+            )
+
+            await MainActor.run {
+                // Update progress after frame generation
+                let overallProgress = (Double(regionIndex) + 1.0) / Double(layout.printerBedRegions.count)
+                self.processingProgress = overallProgress
+            }
+
             let lensTile = LensTileInfo(
-                row: imageTile.row,
-                col: imageTile.col,
-                widthMM: tileWidthMM,
-                heightMM: tileHeightMM,
-                model: model
+                row: region.rowStart,
+                col: region.columnStart,
+                widthMM: regionWidthMM,
+                heightMM: regionHeightMM,
+                model: model,
+                regionIndex: regionIndex,
+                alignmentFrame: alignmentFrame
             )
 
             generatedTiles.append(lensTile)
@@ -635,6 +988,7 @@ class TileGenerator {
     /// Generate tiles from an interlaced image with proper lenticule alignment
     static func generateTiles(
         from image: NSImage,
+        layout: TileLayout? = nil,
         config: TileConfiguration,
         lensParameters: LensParameters,
         dpi: Int,
@@ -648,68 +1002,116 @@ class TileGenerator {
         let imageWidth = cgImage.width
         let imageHeight = cgImage.height
 
-        // Calculate pixels per lenticule
-        let pixelsPerLenticule = Double(dpi) / lensParameters.lpi
-
-        // Calculate tile dimensions in pixels
-        var tileWidthPixels = Int(config.tileWidth * Double(dpi))
-        let tileHeightPixels = Int(config.tileHeight * Double(dpi))
-
-        // CRITICAL: Align tile width to lenticule boundaries
-        // Calculate how many complete lenticules fit in the desired tile width
-        let lenticulesPerTile = floor(Double(tileWidthPixels) / pixelsPerLenticule)
-
-        // Adjust tile width to match exact lenticule boundaries
-        tileWidthPixels = Int(lenticulesPerTile * pixelsPerLenticule)
-
-        // Calculate grid dimensions
-        let cols = Int(ceil(Double(imageWidth) / Double(tileWidthPixels)))
-        let rows = Int(ceil(Double(imageHeight) / Double(tileHeightPixels)))
-
         var tiles: [TileInfo] = []
-        let totalTiles = rows * cols
 
-        for row in 0..<rows {
-            for col in 0..<cols {
-                // Calculate tile rectangle
-                let x = col * tileWidthPixels
-                let y = row * tileHeightPixels
-                let width = min(tileWidthPixels, imageWidth - x)
-                let height = min(tileHeightPixels, imageHeight - y)
+        // Use custom layout if provided, otherwise fall back to uniform grid
+        if let layout = layout {
+            // Generate tiles based on custom boundaries
+            let xBoundaries = [0.0] + layout.verticalBoundaries + [Double(imageWidth)]
+            let yBoundaries = [0.0] + layout.horizontalBoundaries + [Double(imageHeight)]
 
-                let rect = CGRect(x: x, y: y, width: width, height: height)
+            let totalTiles = (xBoundaries.count - 1) * (yBoundaries.count - 1)
+            var tileIndex = 0
 
-                // Crop the tile from the image
-                if let croppedCGImage = cgImage.cropping(to: rect) {
-                    let tileImage = NSImage(cgImage: croppedCGImage, size: CGSize(width: width, height: height))
+            for row in 0..<(yBoundaries.count - 1) {
+                for col in 0..<(xBoundaries.count - 1) {
+                    let x = Int(xBoundaries[col])
+                    let y = Int(yBoundaries[row])
+                    let width = Int(xBoundaries[col + 1]) - x
+                    let height = Int(yBoundaries[row + 1]) - y
 
-                    // Add registration marks if needed
-                    let finalImage: NSImage
-                    if config.mode == .withRegistration {
-                        finalImage = addRegistrationMarks(
-                            to: tileImage,
+                    let rect = CGRect(x: x, y: y, width: width, height: height)
+
+                    // Crop the tile from the image
+                    if let croppedCGImage = cgImage.cropping(to: rect) {
+                        let tileImage = NSImage(cgImage: croppedCGImage, size: CGSize(width: width, height: height))
+
+                        // Add registration marks if needed
+                        let finalImage: NSImage
+                        if config.mode == .withRegistration {
+                            finalImage = addRegistrationMarks(
+                                to: tileImage,
+                                row: row,
+                                col: col,
+                                totalRows: yBoundaries.count - 1,
+                                totalCols: xBoundaries.count - 1,
+                                dpi: dpi
+                            )
+                        } else {
+                            finalImage = tileImage
+                        }
+
+                        let tileInfo = TileInfo(
                             row: row,
                             col: col,
-                            totalRows: rows,
-                            totalCols: cols,
-                            dpi: dpi
+                            rect: rect,
+                            image: finalImage
                         )
-                    } else {
-                        finalImage = tileImage
+                        tiles.append(tileInfo)
                     }
 
-                    let tileInfo = TileInfo(
-                        row: row,
-                        col: col,
-                        rect: rect,
-                        image: finalImage
-                    )
-                    tiles.append(tileInfo)
+                    // Update progress
+                    tileIndex += 1
+                    let progress = Double(tileIndex) / Double(totalTiles)
+                    progressCallback(progress)
                 }
+            }
+        } else {
+            // Fall back to uniform grid (original implementation)
+            let pixelsPerLenticule = Double(dpi) / lensParameters.lpi
 
-                // Update progress
-                let progress = Double(tiles.count) / Double(totalTiles)
-                progressCallback(progress)
+            var tileWidthPixels = Int(config.tileWidth * Double(dpi))
+            let tileHeightPixels = Int(config.tileHeight * Double(dpi))
+
+            // CRITICAL: Align tile width to lenticule boundaries
+            let lenticulesPerTile = floor(Double(tileWidthPixels) / pixelsPerLenticule)
+            tileWidthPixels = Int(lenticulesPerTile * pixelsPerLenticule)
+
+            let cols = Int(ceil(Double(imageWidth) / Double(tileWidthPixels)))
+            let rows = Int(ceil(Double(imageHeight) / Double(tileHeightPixels)))
+            let totalTiles = rows * cols
+
+            for row in 0..<rows {
+                for col in 0..<cols {
+                    let x = col * tileWidthPixels
+                    let y = row * tileHeightPixels
+                    let width = min(tileWidthPixels, imageWidth - x)
+                    let height = min(tileHeightPixels, imageHeight - y)
+
+                    let rect = CGRect(x: x, y: y, width: width, height: height)
+
+                    // Crop the tile from the image
+                    if let croppedCGImage = cgImage.cropping(to: rect) {
+                        let tileImage = NSImage(cgImage: croppedCGImage, size: CGSize(width: width, height: height))
+
+                        // Add registration marks if needed
+                        let finalImage: NSImage
+                        if config.mode == .withRegistration {
+                            finalImage = addRegistrationMarks(
+                                to: tileImage,
+                                row: row,
+                                col: col,
+                                totalRows: rows,
+                                totalCols: cols,
+                                dpi: dpi
+                            )
+                        } else {
+                            finalImage = tileImage
+                        }
+
+                        let tileInfo = TileInfo(
+                            row: row,
+                            col: col,
+                            rect: rect,
+                            image: finalImage
+                        )
+                        tiles.append(tileInfo)
+                    }
+
+                    // Update progress
+                    let progress = Double(tiles.count) / Double(totalTiles)
+                    progressCallback(progress)
+                }
             }
         }
 
@@ -972,6 +1374,196 @@ class LensModelGenerator {
         progressCallback(1.0)
 
         return asset
+    }
+
+    /// Generate an alignment frame for paper positioning
+    /// Creates a thin rectangular border that's printed first in a different color
+    /// The frame is LARGER than the given dimensions so the lens fits inside it
+    static func generateAlignmentFrame(
+        dimensions: CGSize,  // LENS/paper dimensions in mm (the frame will be larger)
+        frameWidth: Double = 2.5,  // Width of frame strips in mm
+        frameHeight: Double = 0.3  // Height (one layer) in mm
+    ) -> MDLAsset? {
+        // The frame extends beyond the lens dimensions by frameWidth on all sides
+        let lensWidthMM = Double(dimensions.width)
+        let lensHeightMM = Double(dimensions.height)
+
+        // Frame outer dimensions (larger than lens)
+        let frameOuterWidth = lensWidthMM + (frameWidth * 2)
+        let frameOuterHeight = lensHeightMM + (frameWidth * 2)
+
+        let allocator = MDLMeshBufferDataAllocator()
+
+        var allVertices: [SIMD3<Float>] = []
+        var allNormals: [SIMD3<Float>] = []
+        var allIndices: [UInt32] = []
+
+        let height = Float(frameHeight)
+        let fw = Float(frameWidth)  // Frame width
+
+        // Create 4 strips forming a rectangular frame
+        // The inner opening is exactly lensWidthMM x lensHeightMM
+        // The outer boundary extends by frameWidth on all sides
+
+        // Bottom strip (front edge) - full width
+        addFrameStrip(
+            x1: 0, z1: 0,
+            x2: Float(frameOuterWidth), z2: fw,
+            height: height,
+            vertices: &allVertices,
+            normals: &allNormals,
+            indices: &allIndices
+        )
+
+        // Top strip (back edge) - full width
+        addFrameStrip(
+            x1: 0, z1: Float(frameOuterHeight) - fw,
+            x2: Float(frameOuterWidth), z2: Float(frameOuterHeight),
+            height: height,
+            vertices: &allVertices,
+            normals: &allNormals,
+            indices: &allIndices
+        )
+
+        // Left strip (excluding corners already covered)
+        addFrameStrip(
+            x1: 0, z1: fw,
+            x2: fw, z2: Float(frameOuterHeight) - fw,
+            height: height,
+            vertices: &allVertices,
+            normals: &allNormals,
+            indices: &allIndices
+        )
+
+        // Right strip (excluding corners already covered)
+        addFrameStrip(
+            x1: Float(frameOuterWidth) - fw, z1: fw,
+            x2: Float(frameOuterWidth), z2: Float(frameOuterHeight) - fw,
+            height: height,
+            vertices: &allVertices,
+            normals: &allNormals,
+            indices: &allIndices
+        )
+
+        // Create vertex buffers
+        let vertexData = Data(bytes: allVertices, count: allVertices.count * MemoryLayout<SIMD3<Float>>.stride)
+        let vertexBuffer = allocator.newBuffer(with: vertexData, type: MDLMeshBufferType.vertex)
+
+        let normalData = Data(bytes: allNormals, count: allNormals.count * MemoryLayout<SIMD3<Float>>.stride)
+        let normalBuffer = allocator.newBuffer(with: normalData, type: MDLMeshBufferType.vertex)
+
+        let indexData = Data(bytes: allIndices, count: allIndices.count * MemoryLayout<UInt32>.stride)
+        let indexBuffer = allocator.newBuffer(with: indexData, type: MDLMeshBufferType.index)
+
+        let vertexDescriptor = MDLVertexDescriptor()
+        vertexDescriptor.attributes[0] = MDLVertexAttribute(
+            name: MDLVertexAttributePosition,
+            format: .float3,
+            offset: 0,
+            bufferIndex: 0
+        )
+        vertexDescriptor.layouts[0] = MDLVertexBufferLayout(stride: MemoryLayout<SIMD3<Float>>.stride)
+
+        vertexDescriptor.attributes[1] = MDLVertexAttribute(
+            name: MDLVertexAttributeNormal,
+            format: .float3,
+            offset: 0,
+            bufferIndex: 1
+        )
+        vertexDescriptor.layouts[1] = MDLVertexBufferLayout(stride: MemoryLayout<SIMD3<Float>>.stride)
+
+        let submesh = MDLSubmesh(
+            indexBuffer: indexBuffer,
+            indexCount: allIndices.count,
+            indexType: .uInt32,
+            geometryType: .triangles,
+            material: nil
+        )
+
+        let mesh = MDLMesh(
+            vertexBuffers: [vertexBuffer, normalBuffer],
+            vertexCount: allVertices.count,
+            descriptor: vertexDescriptor,
+            submeshes: [submesh]
+        )
+
+        let asset = MDLAsset(bufferAllocator: allocator)
+        asset.add(mesh)
+
+        return asset
+    }
+
+    /// Helper to add a rectangular strip to the frame
+    private static func addFrameStrip(
+        x1: Float, z1: Float,
+        x2: Float, z2: Float,
+        height: Float,
+        vertices: inout [SIMD3<Float>],
+        normals: inout [SIMD3<Float>],
+        indices: inout [UInt32]
+    ) {
+        let baseOffset = UInt32(vertices.count)
+
+        // 8 vertices for a rectangular box (4 bottom, 4 top)
+        let bottomVertices: [SIMD3<Float>] = [
+            SIMD3(x1, 0, z1),
+            SIMD3(x2, 0, z1),
+            SIMD3(x2, 0, z2),
+            SIMD3(x1, 0, z2)
+        ]
+
+        let topVertices: [SIMD3<Float>] = [
+            SIMD3(x1, height, z1),
+            SIMD3(x2, height, z1),
+            SIMD3(x2, height, z2),
+            SIMD3(x1, height, z2)
+        ]
+
+        vertices.append(contentsOf: bottomVertices)
+        vertices.append(contentsOf: topVertices)
+
+        // Normals (simplified - pointing outward and up)
+        for _ in 0..<8 {
+            normals.append(SIMD3(0, 1, 0))
+        }
+
+        // Indices for 6 faces of the box
+        // Bottom face
+        indices.append(contentsOf: [
+            baseOffset + 0, baseOffset + 2, baseOffset + 1,
+            baseOffset + 0, baseOffset + 3, baseOffset + 2
+        ])
+
+        // Top face
+        indices.append(contentsOf: [
+            baseOffset + 4, baseOffset + 5, baseOffset + 6,
+            baseOffset + 4, baseOffset + 6, baseOffset + 7
+        ])
+
+        // Side faces
+        // Front
+        indices.append(contentsOf: [
+            baseOffset + 0, baseOffset + 1, baseOffset + 5,
+            baseOffset + 0, baseOffset + 5, baseOffset + 4
+        ])
+
+        // Right
+        indices.append(contentsOf: [
+            baseOffset + 1, baseOffset + 2, baseOffset + 6,
+            baseOffset + 1, baseOffset + 6, baseOffset + 5
+        ])
+
+        // Back
+        indices.append(contentsOf: [
+            baseOffset + 2, baseOffset + 3, baseOffset + 7,
+            baseOffset + 2, baseOffset + 7, baseOffset + 6
+        ])
+
+        // Left
+        indices.append(contentsOf: [
+            baseOffset + 3, baseOffset + 0, baseOffset + 4,
+            baseOffset + 3, baseOffset + 4, baseOffset + 7
+        ])
     }
 
     /// Export asset to STL file
@@ -2526,34 +3118,88 @@ struct TilingView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .padding(.horizontal)
 
-                        // Generate Tiles Button
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Estimated Grid:")
-                                    .font(.subheadline)
-                                Text(estimatedGridSize)
+                        // Calculate Layout Button
+                        if project.tileLayout == nil {
+                            VStack(spacing: 12) {
+                                Text("Smart tiling optimizes for fewest cuts and 3D prints")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                            }
+                                    .multilineTextAlignment(.center)
 
-                            Spacer()
-
-                            Button(action: {
-                                Task {
-                                    await project.generateTiles()
+                                Button(action: {
+                                    project.calculateOptimalLayout()
+                                }) {
+                                    Label("Calculate Optimal Layout", systemImage: "square.grid.3x3")
+                                        .padding(.horizontal, 20)
+                                        .padding(.vertical, 10)
                                 }
-                            }) {
-                                Label("Generate Tiles", systemImage: "square.grid.3x3")
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 10)
+                                .buttonStyle(.borderedProminent)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(project.isProcessing)
+                            .padding()
+                            .background(Color.blue.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(.horizontal)
                         }
-                        .padding()
-                        .background(Color.gray.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .padding(.horizontal)
+
+                        // Layout Preview
+                        if let layout = project.tileLayout, let interlacedImage = project.interlacedImage {
+                            VStack(alignment: .leading, spacing: 16) {
+                                HStack {
+                                    Label("Proposed Tile Layout", systemImage: "rectangle.split.3x3")
+                                        .font(.headline)
+                                    Spacer()
+                                    Text(layout.strategy.rawValue)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.blue.opacity(0.2))
+                                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                                }
+
+                                TileLayoutPreview(
+                                    image: interlacedImage,
+                                    layout: layout,
+                                    dpi: project.outputDPI,
+                                    lpi: project.lensParameters.lpi
+                                )
+
+                                HStack(spacing: 12) {
+                                    Button(action: {
+                                        project.calculateNextLayoutStrategy()
+                                    }) {
+                                        Label("Try Next Strategy", systemImage: "arrow.triangle.2.circlepath")
+                                    }
+                                    .disabled(project.isProcessing)
+
+                                    Button(action: {
+                                        project.tileLayout = nil
+                                    }) {
+                                        Label("Start Over", systemImage: "arrow.counterclockwise")
+                                    }
+                                    .disabled(project.isProcessing)
+
+                                    Spacer()
+
+                                    Button(action: {
+                                        Task {
+                                            await project.generateTiles()
+                                        }
+                                    }) {
+                                        Label("Approve & Generate Tiles", systemImage: "checkmark.circle")
+                                            .padding(.horizontal, 20)
+                                            .padding(.vertical, 10)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.green)
+                                    .disabled(project.isProcessing)
+                                }
+                            }
+                            .padding()
+                            .background(Color.green.opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(.horizontal)
+                        }
 
                         // Progress indicator
                         if project.isProcessing {
@@ -2994,13 +3640,26 @@ struct Model3DView: View {
                                             .font(.caption)
                                     }
                                     .buttonStyle(.borderedProminent)
+
+                                    Button(action: { exportAllAlignmentFrames() }) {
+                                        Label("Export All Alignment Frames", systemImage: "square.dashed")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.orange)
                                 }
                                 .padding(.horizontal)
 
-                                Text("Each lens tile corresponds to one image tile. Print and assemble in order.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Each lens tile matches one printer bed region.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("Alignment frames: Print these first in a different color, pause printer, align paper inside frame, then print lens on top.")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                        .fontWeight(.medium)
+                                }
+                                .padding(.horizontal)
 
                                 // Lens tiles grid
                                 ScrollView {
@@ -3110,6 +3769,35 @@ struct Model3DView: View {
             print("✅ All lens tiles exported to: \(folderURL.path)")
         }
     }
+
+    private func exportAllAlignmentFrames() {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.canCreateDirectories = true
+        openPanel.title = "Choose Export Folder"
+        openPanel.message = "Select a folder to export all alignment frames"
+
+        let response = openPanel.runModal()
+        guard response == .OK, let folderURL = openPanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for lensTile in project.lensTiles {
+                guard let frame = lensTile.alignmentFrame else { continue }
+
+                let fileURL = folderURL.appendingPathComponent(lensTile.frameFilename(projectName: project.name))
+
+                do {
+                    try LensModelGenerator.exportSTL(asset: frame, to: fileURL)
+                    print("✅ Exported: \(lensTile.frameName)")
+                } catch {
+                    print("❌ Failed to export \(lensTile.frameName): \(error.localizedDescription)")
+                }
+            }
+
+            print("✅ All alignment frames exported to: \(folderURL.path)")
+        }
+    }
 }
 
 // MARK: - Lens Tile Thumbnail View
@@ -3164,5 +3852,150 @@ struct LensTileThumbnailView: View {
             }
         }
         .frame(width: 200)
+    }
+}
+
+// MARK: - Tile Layout Preview
+
+struct TileLayoutPreview: View {
+    let image: NSImage
+    let layout: TileLayout
+    let dpi: Int
+    let lpi: Double
+
+    var body: some View {
+        VStack(spacing: 16) {
+            // Statistics
+            HStack(spacing: 40) {
+                StatBox(label: "Paper Pieces", value: "\(paperPiecesCount)", color: .blue)
+                StatBox(label: "Cuts Needed", value: "\(cutsNeeded)", color: .orange)
+                StatBox(label: "3D Tiles", value: "\(lensTilesCount)", color: .green)
+                StatBox(label: "Bed Size", value: "\(maxBedDimension)\"", color: .purple)
+            }
+
+            // Visual preview
+            GeometryReader { geometry in
+                let imageSize = image.size
+                let aspectRatio = imageSize.width / imageSize.height
+                let previewHeight = geometry.size.width / aspectRatio
+
+                ZStack {
+                    // Background image
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: geometry.size.width, height: previewHeight)
+
+                    // Printer bed regions overlay
+                    Canvas { context, size in
+                        let scaleX = size.width / imageSize.width
+                        let scaleY = size.height / imageSize.height
+
+                        // Draw printer bed regions (alternating colors)
+                        let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .cyan]
+
+                        // Get boundary arrays
+                        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+                        let xBoundaries = [0.0] + layout.verticalBoundaries + [Double(cgImage.width)]
+                        let yBoundaries = [0.0] + layout.horizontalBoundaries + [Double(cgImage.height)]
+
+                        for (index, region) in layout.printerBedRegions.enumerated() {
+                            let x1 = xBoundaries[region.columnStart] * scaleX
+                            let x2 = xBoundaries[region.columnEnd] * scaleX
+                            let y1 = yBoundaries[region.rowStart] * scaleY
+                            let y2 = yBoundaries[region.rowEnd] * scaleY
+
+                            let rect = CGRect(x: x1, y: y1, width: x2 - x1, height: y2 - y1)
+
+                            context.fill(
+                                Path(rect),
+                                with: .color(colors[index % colors.count].opacity(0.15))
+                            )
+                        }
+
+                        // Draw grid lines
+                        context.stroke(
+                            Path { path in
+                                // Vertical lines
+                                for boundary in layout.verticalBoundaries {
+                                    let x = boundary * scaleX
+                                    path.move(to: CGPoint(x: x, y: 0))
+                                    path.addLine(to: CGPoint(x: x, y: size.height))
+                                }
+
+                                // Horizontal lines
+                                for boundary in layout.horizontalBoundaries {
+                                    let y = boundary * scaleY
+                                    path.move(to: CGPoint(x: 0, y: y))
+                                    path.addLine(to: CGPoint(x: size.width, y: y))
+                                }
+                            },
+                            with: .color(.white),
+                            lineWidth: 2
+                        )
+                    }
+                    .frame(width: geometry.size.width, height: previewHeight)
+                }
+            }
+            .frame(height: 400)
+            .background(Color.black.opacity(0.8))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            // Legend
+            Text("Each colored region = one 3D printer bed load")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var paperPiecesCount: Int {
+        let cols = layout.verticalBoundaries.count + 1
+        let rows = layout.horizontalBoundaries.count + 1
+        return cols * rows
+    }
+
+    private var cutsNeeded: Int {
+        // Estimate cuts based on remainder pieces
+        let widthInches = Double(image.size.width) * 72.0 / Double(dpi)  // Convert to inches
+        let heightInches = Double(image.size.height) * 72.0 / Double(dpi)
+
+        var cuts = 0
+        if widthInches.truncatingRemainder(dividingBy: layout.paperWidth) > 0.1 {
+            cuts += (layout.horizontalBoundaries.count + 1)
+        }
+        if heightInches.truncatingRemainder(dividingBy: layout.paperHeight) > 0.1 {
+            cuts += (layout.verticalBoundaries.count + 1)
+        }
+        return cuts
+    }
+
+    private var lensTilesCount: Int {
+        return layout.printerBedRegions.count
+    }
+
+    private var maxBedDimension: String {
+        return String(format: "%.1f", layout.maxBedSize)
+    }
+}
+
+struct StatBox: View {
+    let label: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value)
+                .font(.title2)
+                .fontWeight(.bold)
+                .foregroundStyle(color)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(minWidth: 80)
+        .padding(12)
+        .background(color.opacity(0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
