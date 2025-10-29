@@ -666,5 +666,426 @@ These may be addressed in future versions.
 
 ---
 
-**Document Status:** Ready for development
-**Last Updated:** October 27, 2025
+## Implementation Notes - Session October 27, 2025
+
+### What We Actually Built
+
+**Development Approach:** Single-file architecture
+- All code consolidated into `ContentView.swift` (~1800 lines)
+- Reason: Xcode file detection issues with separate Model/View files
+- Works well for app of this complexity
+- Future: Can refactor into modules if needed
+
+**Phases Completed:**
+- ✅ Phase 1: Image Import (working)
+- ✅ Phase 2: Lens Configuration (working)
+- ✅ Phase 3: Interlacing Engine (working)
+- ✅ Phase 4: Enhanced Preview & Export (working)
+- ⏳ Phase 5-10: Not yet started
+
+---
+
+### Critical Implementation Details
+
+#### 1. Retina Display / Points vs Pixels Issue
+
+**Problem:** On Retina displays, `NSImage.size` returns **points**, not **pixels**. At 2x scaling, this gives half the actual pixel dimensions, causing cropped output.
+
+**Solution:**
+```swift
+// WRONG - Returns points (half size on Retina)
+let dimensions = image.size
+
+// CORRECT - Returns actual pixel dimensions
+guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+let dimensions = CGSize(width: cgImage.width, height: cgImage.height)
+```
+
+**Location:** `SourceImage.dimensions` property in ContentView.swift:92-107
+
+**Impact:** Critical for interlacing - using wrong dimensions caused only corner of image to render.
+
+---
+
+#### 2. App Sandbox Entitlements
+
+**Problem:** Export function couldn't display save panel. Console error:
+```
+Unable to display save panel: your app has the User Selected File Read
+entitlement but it needs User Selected File Read/Write to display save panels.
+```
+
+**Solution:** Created `Lenticular Fancy Printer.entitlements` file:
+```xml
+<key>com.apple.security.files.user-selected.read-write</key>
+<true/>
+```
+
+**Setup in Xcode:**
+1. Add entitlements file to project
+2. Build Settings → Code Signing Entitlements → set path
+3. Or: Signing & Capabilities tab → add entitlements reference
+
+**Critical:** Without read/write permission, NSSavePanel silently fails. No error in UI, only visible in Console.app.
+
+**Location:** `Lenticular Fancy Printer/Lenticular Fancy Printer.entitlements`
+
+---
+
+#### 3. Image Scaling: Aspect-Fit vs Stretch/Crop
+
+**Problem:** When user changes output dimensions to different aspect ratio than source images, initial implementation cropped or stretched images.
+
+**Solution:** Implemented aspect-fit scaling with letterboxing:
+```swift
+// Calculate aspect ratios
+let sourceAspect = Double(sourceWidth) / Double(sourceHeight)
+let targetAspect = Double(outputWidth) / Double(outputHeight)
+
+// Scale to fit (maintains aspect ratio)
+if sourceAspect > targetAspect {
+    // Source is wider - fit to width
+    destHeight = Int(Double(outputWidth) / sourceAspect)
+    destY = (outputHeight - destHeight) / 2  // Center vertically
+} else {
+    // Source is taller - fit to height
+    destWidth = Int(Double(outputHeight) * sourceAspect)
+    destX = (outputWidth - destWidth) / 2  // Center horizontally
+}
+
+// Fill background with black, draw scaled image centered
+NSColor.black.setFill()
+NSRect(x: 0, y: 0, width: outputWidth, height: outputHeight).fill()
+nsImage.draw(in: NSRect(x: destX, y: destY, width: destWidth, height: destHeight), ...)
+```
+
+**Location:** InterlaceEngine.interlace() in ContentView.swift:307-353
+
+**User Experience:** Entire source image always visible, letterboxed if aspect ratios don't match. Better than cropping for lenticular work where user needs full image control.
+
+---
+
+#### 4. Physical Dimensions System
+
+**Architecture:**
+- User thinks in **inches** (physical print size)
+- Computer calculates in **pixels** (actual image data)
+- **DPI** bridges the two: `pixels = inches × DPI`
+
+**Implementation:**
+```swift
+// Published properties
+@Published var outputDPI: Int = 300
+@Published var outputWidth: Int = 0    // pixels
+@Published var outputHeight: Int = 0   // pixels
+@Published var aspectRatioLocked: Bool = true
+
+// Computed properties
+var physicalWidth: Double {
+    return Double(outputWidth) / Double(outputDPI)
+}
+
+var physicalHeight: Double {
+    return Double(outputHeight) / Double(outputDPI)
+}
+
+// Setters maintain relationships
+func setPhysicalWidth(_ inches: Double) {
+    let newWidth = Int(inches * Double(outputDPI))
+    setOutputWidth(newWidth)  // Respects aspect ratio lock
+}
+
+func setOutputDPI(_ newDPI: Int) {
+    // CRITICAL: Maintain physical size when DPI changes
+    let currentPhysicalWidth = physicalWidth
+    let currentPhysicalHeight = physicalHeight
+    outputDPI = newDPI
+    outputWidth = Int(currentPhysicalWidth * Double(newDPI))
+    outputHeight = Int(currentPhysicalHeight * Double(newDPI))
+}
+```
+
+**User Workflow:**
+1. Set physical size: "8 inches × 10 inches"
+2. Set DPI: 300 (default)
+3. App calculates: 2400×3000 pixels
+4. Change DPI to 600 → auto-updates to 4800×6000 pixels (maintains 8"×10")
+
+**Location:** Project class in ContentView.swift:118-156
+
+---
+
+#### 5. Export Debugging Journey
+
+**Attempts that failed:**
+1. ~~FileDocument with .fileExporter~~ → EXC_BREAKPOINT crash
+2. ~~Sheet modal with custom ExportSheet~~ → Dark box appeared, no dialog
+3. ~~Async Task with await savePanel.begin()~~ → No dialog appeared
+4. ~~runModal() directly~~ → App froze (blocked main thread)
+
+**What finally worked:**
+```swift
+private func exportInterlacedImage() {
+    // Simple, synchronous approach
+    let savePanel = NSSavePanel()
+    savePanel.allowedContentTypes = [.png]
+    savePanel.canCreateDirectories = true
+    savePanel.nameFieldStringValue = "interlaced_output.png"
+
+    let response = savePanel.runModal()
+
+    guard response == .OK, let url = savePanel.url else { return }
+
+    // Write on background thread
+    DispatchQueue.global(qos: .userInitiated).async {
+        // ... write PNG data ...
+    }
+}
+```
+
+**Key lesson:** Sometimes simple synchronous code works better than complex async patterns. `runModal()` is fine for user-initiated actions like export.
+
+**Location:** InterlaceView.exportInterlacedImage() in ContentView.swift:1741-1789
+
+---
+
+#### 6. Interlacing Algorithm Details
+
+**Core concept:** Each vertical column in output comes from one source image, cycling through images across each lenticule.
+
+**Implementation:**
+```swift
+// Calculate width of each lenticule in pixels
+let pixelsPerLenticule = Double(dpi) / lensParameters.lpi
+
+// For each output column
+for x in 0..<outputWidth {
+    // Position within current lenticule (0 to pixelsPerLenticule)
+    let lenticulePosition = Double(x).truncatingRemainder(dividingBy: pixelsPerLenticule)
+
+    // Which source image? (0 to numImages-1)
+    let imageIndex = Int((lenticulePosition / pixelsPerLenticule) * numImages)
+    let sourceImage = cgImages[imageIndex]
+
+    // Copy entire vertical strip from source to output
+    for y in 0..<outputHeight {
+        // Sample pixel at (x, y) from source
+        // Write to output at (x, y)
+    }
+}
+```
+
+**Performance:** ~2-3 seconds for 2400×3000 output with 2 images. Acceptable for user workflow.
+
+**Potential optimizations (if needed):**
+- Use Metal GPU processing
+- Process multiple columns in parallel
+- Cache scaled source images
+
+**Location:** InterlaceEngine.interlace() in ContentView.swift:257-377
+
+---
+
+#### 7. Preview System Architecture
+
+**Three modes implemented:**
+
+**Interlaced Mode:**
+- Shows actual interlaced output
+- Optional lenticule grid overlay (vertical lines at lenticule boundaries)
+- Zoom 10%-400%
+
+**Animated Mode:**
+- Cycles through source images to simulate lenticular effect
+- Play/pause control
+- Speed adjustment: 0.5-10 fps
+- Manual scrubbing: slider to control viewing angle
+
+**Source Images Mode:**
+- Side-by-side comparison of all source images
+- Shows up to 4 images simultaneously
+
+**Implementation Note:** Animation uses Timer, not CADisplayLink (Timer is simpler and sufficient for this use case).
+
+```swift
+private func startAnimation() {
+    animationTimer = Timer.scheduledTimer(
+        withTimeInterval: 1.0 / animationSpeed,
+        repeats: true
+    ) { _ in
+        currentFrameIndex = (currentFrameIndex + 1) % project.sourceImages.count
+    }
+}
+```
+
+**Location:** InterlaceView in ContentView.swift:1263-1790
+
+---
+
+### Lessons Learned
+
+**1. Xcode Project Structure**
+- Single-file approach avoided file detection issues
+- For this app size (~1800 lines), single file is manageable
+- Good naming conventions and MARK comments keep it organized
+
+**2. Always Check Console.app**
+- Critical errors (like entitlements) don't show in UI
+- Console revealed the save panel permission issue immediately
+- Debug with emoji print statements: 🔵 🟡 🟢 ✅ ❌ 💾
+
+**3. Retina Display Testing**
+- Test on actual hardware, not just simulator
+- Points ≠ Pixels on Retina displays
+- Always use CGImage dimensions for pixel-accurate work
+
+**4. Sandboxing is Strict**
+- Need explicit read-write entitlements for save dialogs
+- Security-scoped resource access required for opening user-selected files
+- Must call startAccessingSecurityScopedResource() / stopAccessingSecurityScopedResource()
+
+**5. Simple Solutions Often Best**
+- Tried many complex async approaches for export
+- Simple synchronous runModal() worked perfectly
+- Don't over-engineer
+
+---
+
+### Known Issues & Future Improvements
+
+**Current Limitations:**
+1. **No undo/redo** - User must manually revert parameter changes
+2. **No project save/load** - Settings not persisted between sessions
+3. **Preview performance** - Full-res preview can be slow for large images
+4. **Memory usage** - Large images (6'×5') may cause issues
+
+**Recommended Next Steps:**
+1. **Phase 5: Tiling System**
+   - Critical for large prints (>8.5"×11")
+   - Must align tiles with lenticule boundaries
+   - Generate assembly guide
+
+2. **Phase 6: 3D Model Generation**
+   - Use ModelIO to generate STL files
+   - Match lenticule pitch exactly to interlacing
+   - Include alignment markers
+
+3. **Project Persistence**
+   - Codable protocol for save/load
+   - Store reference to source images (URLs)
+   - Save lens parameters and custom presets
+
+4. **Performance Optimization**
+   - Lower-res preview with full-res export
+   - Tile-based processing for large images
+   - Consider Metal acceleration
+
+---
+
+### File Structure (Actual)
+
+```
+Lenticular Fancy Printer/
+├── Lenticular Fancy Printer.xcodeproj/
+├── Lenticular Fancy Printer/
+│   ├── Assets.xcassets/
+│   ├── ContentView.swift              # All code (1800 lines)
+│   ├── Lenticular_Fancy_PrinterApp.swift
+│   └── Lenticular Fancy Printer.entitlements  # CRITICAL for export
+├── SPECIFICATION.md
+├── IMPLEMENTATION.md                  # This file
+└── .gitignore                         # Xcode-specific
+
+Notable: Simple structure, single file approach
+```
+
+---
+
+### Code Reference Guide
+
+**Key Sections in ContentView.swift:**
+
+| Line Range | Section | Description |
+|------------|---------|-------------|
+| 15-61 | LensParameters | Lens geometry data structure |
+| 62-108 | SourceImage | Image model with security-scoped access |
+| 110-256 | Project | Main application state |
+| 257-377 | InterlaceEngine | Core interlacing algorithm |
+| 695-1218 | LensConfigView | Parameter UI with presets |
+| 1067-1217 | LensCrossSectionView | 1-inch scale visualization |
+| 1222-1259 | PreviewMode | Enum for preview types |
+| 1263-1790 | InterlaceView | Preview & export UI |
+
+**Search Tips:**
+- Find by `// MARK: -` comments
+- Key functions: `interlace()`, `exportInterlacedImage()`, `generateInterlacedImage()`
+- Security-scoped access: search for `startAccessingSecurityScopedResource`
+
+---
+
+### Testing Notes
+
+**What's Been Tested:**
+- ✅ Import 2 landscape photos (1920×1080)
+- ✅ Change lens parameters (16 LPI tested)
+- ✅ Generate interlaced output at various sizes (3"×1.69", 8"×2")
+- ✅ Aspect ratio lock/unlock functionality
+- ✅ Export to PNG (successful writes)
+- ✅ Zoom controls in preview
+- ✅ Grid overlay display
+
+**Not Yet Tested:**
+- Extreme image sizes (>10,000 px)
+- Many source images (>10)
+- Very high LPI values (>100)
+- Memory limits with multiple large projects
+- Actual printing and physical lens alignment
+
+**Recommended Physical Tests:**
+1. Print interlaced output at 300 DPI
+2. 3D print lens with matching LPI
+3. Align lens to print
+4. Evaluate viewing angle and clarity
+5. Iterate parameters based on results
+
+---
+
+### Dependencies & Requirements
+
+**Minimum System Requirements:**
+- macOS 14.0+ (Sonnet)
+- Xcode 15.0+
+- Swift 5.9+
+
+**Frameworks Used:**
+- SwiftUI (UI)
+- AppKit (NSImage, NSSavePanel)
+- Combine (ObservableObject, @Published)
+- CoreGraphics (CGContext, CGImage)
+- UniformTypeIdentifiers (file types)
+
+**No Third-Party Dependencies:** Entirely built with Apple frameworks.
+
+---
+
+### Git Repository
+
+**GitHub:** https://github.com/Zellle/lenticularly
+
+**Commit Structure:**
+- Initial commit: Complete working app (Phases 1-4)
+- Comprehensive commit message documenting all features
+- Proper .gitignore for Xcode projects
+
+**Branch Strategy:** Single `main` branch (for now)
+
+**Future:** Consider feature branches for:
+- Phase 5 (tiling)
+- Phase 6 (3D models)
+- Experimental features
+
+---
+
+**Document Status:** Implementation complete through Phase 4
+**Last Updated:** October 27, 2025 (End of Session)
+**Next Session:** Begin Phase 5 (Tiling) or Phase 6 (3D Models) per user preference

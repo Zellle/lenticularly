@@ -107,6 +107,48 @@ struct SourceImage: Identifiable {
     }
 }
 
+/// Tile configuration
+struct TileConfiguration: Codable, Equatable {
+    var tileWidth: Double = 8.5  // inches
+    var tileHeight: Double = 11.0  // inches
+    var mode: TileMode = .edgeToEdge
+    var bleedAmount: Double = 0.125  // inches (for bleed mode)
+    var showRegistrationMarks: Bool = false
+
+    enum TileMode: String, Codable, CaseIterable {
+        case edgeToEdge = "Edge-to-Edge"
+        case withBleed = "With Bleed"
+        case withRegistration = "With Registration Marks"
+    }
+
+    // Common presets
+    static let letter = TileConfiguration(tileWidth: 8.5, tileHeight: 11.0)
+    static let a4 = TileConfiguration(tileWidth: 8.27, tileHeight: 11.69)
+    static let square8 = TileConfiguration(tileWidth: 8.0, tileHeight: 8.0)
+}
+
+/// Information about a single tile
+struct TileInfo: Identifiable, Equatable {
+    let id = UUID()
+    let row: Int
+    let col: Int
+    let rect: CGRect  // Position in pixels in the full interlaced image
+    var image: NSImage?  // The actual tile image data
+
+    var name: String {
+        return "Tile_R\(String(format: "%02d", row + 1))_C\(String(format: "%02d", col + 1))"
+    }
+
+    func filename(projectName: String) -> String {
+        return "\(projectName)_\(name).png"
+    }
+
+    // Custom Equatable implementation that ignores image comparison
+    static func == (lhs: TileInfo, rhs: TileInfo) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
 /// Project model
 class Project: ObservableObject {
     @Published var name: String = "Untitled Project"
@@ -119,6 +161,8 @@ class Project: ObservableObject {
     @Published var outputWidth: Int = 0
     @Published var outputHeight: Int = 0
     @Published var aspectRatioLocked: Bool = true
+    @Published var tileConfiguration = TileConfiguration()
+    @Published var tiles: [TileInfo] = []
 
     // Physical dimensions in inches (computed from pixels and DPI)
     var physicalWidth: Double {
@@ -252,12 +296,63 @@ class Project: ObservableObject {
             processingProgress = 1.0
         }
     }
+
+    // MARK: - Tiling
+
+    func generateTiles() async {
+        guard let interlacedImage = interlacedImage else { return }
+
+        await MainActor.run {
+            isProcessing = true
+            processingProgress = 0.0
+        }
+
+        let result = await TileGenerator.generateTiles(
+            from: interlacedImage,
+            config: tileConfiguration,
+            lensParameters: lensParameters,
+            dpi: outputDPI,
+            projectName: name,
+            progressCallback: { progress in
+                Task { @MainActor in
+                    self.processingProgress = progress
+                }
+            }
+        )
+
+        await MainActor.run {
+            tiles = result
+            isProcessing = false
+            processingProgress = 1.0
+        }
+    }
 }
 
 // MARK: - Interlace Engine
 
 class InterlaceEngine {
     static func interlace(
+        sourceImages: [SourceImage],
+        lensParameters: LensParameters,
+        dpi: Int,
+        outputWidth: Int,
+        outputHeight: Int,
+        progressCallback: @escaping (Double) -> Void
+    ) async -> NSImage? {
+        // Run on background thread to avoid blocking UI
+        return await Task.detached(priority: .userInitiated) {
+            return await Self.performInterlace(
+                sourceImages: sourceImages,
+                lensParameters: lensParameters,
+                dpi: dpi,
+                outputWidth: outputWidth,
+                outputHeight: outputHeight,
+                progressCallback: progressCallback
+            )
+        }.value
+    }
+
+    private static func performInterlace(
         sourceImages: [SourceImage],
         lensParameters: LensParameters,
         dpi: Int,
@@ -292,20 +387,18 @@ class InterlaceEngine {
 
         let numImages = Double(loadedImages.count)
 
-        // Create output bitmap context
+        // Create output bitmap buffer
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
-        guard let context = CGContext(
-            data: nil,
-            width: outputWidth,
-            height: outputHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: outputWidth * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
+        let bytesPerPixel = 4
+        let bytesPerRow = outputWidth * bytesPerPixel
+        let bufferSize = bytesPerRow * outputHeight
 
-        // Scale and get CGImages from NSImages
-        var cgImages: [CGImage] = []
+        var outputBuffer = [UInt8](repeating: 0, count: bufferSize)
+
+        // Scale and get CGImages from NSImages, extract bitmap data
+        var bitmapDatas: [[UInt8]] = []
+        var bytesPerRows: [Int] = []
+
         for nsImage in loadedImages {
             // Get source size
             guard let sourceRep = nsImage.representations.first else { continue }
@@ -349,61 +442,259 @@ class InterlaceEngine {
             guard let cgImage = scaledImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
                 return nil
             }
-            cgImages.append(cgImage)
+
+            // Create a bitmap context with known format to extract pixels
+            let sourceBytesPerRow = outputWidth * bytesPerPixel
+            let sourceBufferSize = sourceBytesPerRow * outputHeight
+            var sourceBuffer = [UInt8](repeating: 0, count: sourceBufferSize)
+
+            guard let sourceContext = CGContext(
+                data: &sourceBuffer,
+                width: outputWidth,
+                height: outputHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: sourceBytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return nil
+            }
+
+            // Draw the image into our known-format buffer
+            sourceContext.draw(cgImage, in: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
+
+            bitmapDatas.append(sourceBuffer)
+            bytesPerRows.append(sourceBytesPerRow)
         }
 
-        // Interlace column by column
+        // Interlace column by column - write directly to output buffer
         for x in 0..<outputWidth {
             // Calculate which lenticule and position within lenticule
             let lenticulePosition = Double(x).truncatingRemainder(dividingBy: pixelsPerLenticule)
 
             // Determine which source image this strip comes from
             let imageIndex = Int((lenticulePosition / pixelsPerLenticule) * numImages)
-            let clampedIndex = min(imageIndex, cgImages.count - 1)
+            let clampedIndex = min(imageIndex, bitmapDatas.count - 1)
 
-            let sourceImage = cgImages[clampedIndex]
+            let sourceBitmap = bitmapDatas[clampedIndex]
+            let sourceBytesPerRow = bytesPerRows[clampedIndex]
 
             // Copy this column from source to output
             for y in 0..<outputHeight {
-                // Sample pixel from source (images are already scaled to output size)
-                let pixelData = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
-                defer { pixelData.deallocate() }
+                let sourceIndex = (y * sourceBytesPerRow) + (x * bytesPerPixel)
+                let outputIndex = (y * bytesPerRow) + (x * bytesPerPixel)
 
-                let bitmapContext = CGContext(
-                    data: pixelData,
-                    width: 1,
-                    height: 1,
-                    bitsPerComponent: 8,
-                    bytesPerRow: 4,
-                    space: colorSpace,
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                )
+                // Check bounds
+                guard sourceIndex + 3 < sourceBitmap.count,
+                      outputIndex + 3 < outputBuffer.count else { continue }
 
-                bitmapContext?.draw(sourceImage, in: CGRect(x: -x, y: -y, width: outputWidth, height: outputHeight))
-
-                let r = CGFloat(pixelData[0]) / 255.0
-                let g = CGFloat(pixelData[1]) / 255.0
-                let b = CGFloat(pixelData[2]) / 255.0
-                let a = CGFloat(pixelData[3]) / 255.0
-
-                context.setFillColor(red: r, green: g, blue: b, alpha: a)
-                context.fill(CGRect(x: x, y: y, width: 1, height: 1))
+                // Copy RGBA bytes directly
+                outputBuffer[outputIndex] = sourceBitmap[sourceIndex]
+                outputBuffer[outputIndex + 1] = sourceBitmap[sourceIndex + 1]
+                outputBuffer[outputIndex + 2] = sourceBitmap[sourceIndex + 2]
+                outputBuffer[outputIndex + 3] = sourceBitmap[sourceIndex + 3]
             }
 
-            // Update progress
-            if x % 100 == 0 {
+            // Update progress and yield every 50 columns to keep UI responsive
+            if x % 50 == 0 {
                 let progress = Double(x) / Double(outputWidth)
                 progressCallback(progress)
+                await Task.yield()
             }
         }
 
         progressCallback(1.0)
 
-        // Create NSImage from context
+        // Create CGImage from output buffer
+        guard let context = CGContext(
+            data: &outputBuffer,
+            width: outputWidth,
+            height: outputHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+
         guard let cgImage = context.makeImage() else { return nil }
         let outputImage = NSImage(cgImage: cgImage, size: CGSize(width: outputWidth, height: outputHeight))
 
         return outputImage
+    }
+}
+
+// MARK: - Tile Generator
+
+class TileGenerator {
+    /// Generate tiles from an interlaced image with proper lenticule alignment
+    static func generateTiles(
+        from image: NSImage,
+        config: TileConfiguration,
+        lensParameters: LensParameters,
+        dpi: Int,
+        projectName: String,
+        progressCallback: @escaping (Double) -> Void
+    ) async -> [TileInfo] {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return []
+        }
+
+        let imageWidth = cgImage.width
+        let imageHeight = cgImage.height
+
+        // Calculate pixels per lenticule
+        let pixelsPerLenticule = Double(dpi) / lensParameters.lpi
+
+        // Calculate tile dimensions in pixels
+        var tileWidthPixels = Int(config.tileWidth * Double(dpi))
+        let tileHeightPixels = Int(config.tileHeight * Double(dpi))
+
+        // CRITICAL: Align tile width to lenticule boundaries
+        // Calculate how many complete lenticules fit in the desired tile width
+        let lenticulesPerTile = floor(Double(tileWidthPixels) / pixelsPerLenticule)
+
+        // Adjust tile width to match exact lenticule boundaries
+        tileWidthPixels = Int(lenticulesPerTile * pixelsPerLenticule)
+
+        // Calculate grid dimensions
+        let cols = Int(ceil(Double(imageWidth) / Double(tileWidthPixels)))
+        let rows = Int(ceil(Double(imageHeight) / Double(tileHeightPixels)))
+
+        var tiles: [TileInfo] = []
+        let totalTiles = rows * cols
+
+        for row in 0..<rows {
+            for col in 0..<cols {
+                // Calculate tile rectangle
+                let x = col * tileWidthPixels
+                let y = row * tileHeightPixels
+                let width = min(tileWidthPixels, imageWidth - x)
+                let height = min(tileHeightPixels, imageHeight - y)
+
+                let rect = CGRect(x: x, y: y, width: width, height: height)
+
+                // Crop the tile from the image
+                if let croppedCGImage = cgImage.cropping(to: rect) {
+                    let tileImage = NSImage(cgImage: croppedCGImage, size: CGSize(width: width, height: height))
+
+                    // Add registration marks if needed
+                    let finalImage: NSImage
+                    if config.mode == .withRegistration {
+                        finalImage = addRegistrationMarks(
+                            to: tileImage,
+                            row: row,
+                            col: col,
+                            totalRows: rows,
+                            totalCols: cols,
+                            dpi: dpi
+                        )
+                    } else {
+                        finalImage = tileImage
+                    }
+
+                    let tileInfo = TileInfo(
+                        row: row,
+                        col: col,
+                        rect: rect,
+                        image: finalImage
+                    )
+                    tiles.append(tileInfo)
+                }
+
+                // Update progress
+                let progress = Double(tiles.count) / Double(totalTiles)
+                progressCallback(progress)
+            }
+        }
+
+        progressCallback(1.0)
+        return tiles
+    }
+
+    /// Add registration marks to a tile for alignment
+    private static func addRegistrationMarks(
+        to image: NSImage,
+        row: Int,
+        col: Int,
+        totalRows: Int,
+        totalCols: Int,
+        dpi: Int
+    ) -> NSImage {
+        let markSize: CGFloat = CGFloat(dpi) * 0.25  // 0.25 inch marks
+        let padding: CGFloat = CGFloat(dpi) * 0.1  // 0.1 inch from edge
+
+        let newSize = NSSize(
+            width: image.size.width + (padding + markSize) * 2,
+            height: image.size.height + (padding + markSize) * 2
+        )
+
+        let markedImage = NSImage(size: newSize)
+        markedImage.lockFocus()
+
+        // White background
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: newSize).fill()
+
+        // Draw original image centered
+        image.draw(
+            in: NSRect(
+                x: padding + markSize,
+                y: padding + markSize,
+                width: image.size.width,
+                height: image.size.height
+            ),
+            from: NSRect(origin: .zero, size: image.size),
+            operation: .copy,
+            fraction: 1.0
+        )
+
+        // Draw corner registration marks (crosshairs)
+        NSColor.black.setStroke()
+        let markPath = NSBezierPath()
+        markPath.lineWidth = 2
+
+        // Top-left crosshair
+        markPath.move(to: NSPoint(x: padding, y: padding + markSize))
+        markPath.line(to: NSPoint(x: padding + markSize, y: padding + markSize))
+        markPath.move(to: NSPoint(x: padding + markSize/2, y: padding))
+        markPath.line(to: NSPoint(x: padding + markSize/2, y: padding + markSize))
+
+        // Top-right crosshair
+        let topRightX = newSize.width - padding - markSize
+        markPath.move(to: NSPoint(x: topRightX, y: padding + markSize))
+        markPath.line(to: NSPoint(x: topRightX + markSize, y: padding + markSize))
+        markPath.move(to: NSPoint(x: topRightX + markSize/2, y: padding))
+        markPath.line(to: NSPoint(x: topRightX + markSize/2, y: padding + markSize))
+
+        // Bottom-left crosshair
+        let bottomY = newSize.height - padding - markSize
+        markPath.move(to: NSPoint(x: padding, y: bottomY))
+        markPath.line(to: NSPoint(x: padding + markSize, y: bottomY))
+        markPath.move(to: NSPoint(x: padding + markSize/2, y: bottomY))
+        markPath.line(to: NSPoint(x: padding + markSize/2, y: bottomY + markSize))
+
+        // Bottom-right crosshair
+        markPath.move(to: NSPoint(x: topRightX, y: bottomY))
+        markPath.line(to: NSPoint(x: topRightX + markSize, y: bottomY))
+        markPath.move(to: NSPoint(x: topRightX + markSize/2, y: bottomY))
+        markPath.line(to: NSPoint(x: topRightX + markSize/2, y: bottomY + markSize))
+
+        markPath.stroke()
+
+        // Add tile numbering
+        let tileLabel = "R\(row + 1)C\(col + 1)"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+            .foregroundColor: NSColor.black
+        ]
+        let labelSize = (tileLabel as NSString).size(withAttributes: attributes)
+        (tileLabel as NSString).draw(
+            at: NSPoint(x: padding, y: padding),
+            withAttributes: attributes
+        )
+
+        markedImage.unlockFocus()
+        return markedImage
     }
 }
 
@@ -455,7 +746,7 @@ struct ContentView: View {
                 case .interlace:
                     InterlaceView(project: project)
                 case .tiles:
-                    PlaceholderView(title: "Tile Configuration", subtitle: "Coming in Phase 5")
+                    TilingView(project: project)
                 case .model3D:
                     PlaceholderView(title: "3D Model Generation", subtitle: "Coming in Phase 6")
                 case .export:
@@ -1823,5 +2114,374 @@ struct InterlaceView: View {
                 print("❌ Export error: \(error.localizedDescription)")
             }
         }
+    }
+}
+
+// MARK: - Tiling View
+
+struct TilingView: View {
+    @ObservedObject var project: Project
+    @State private var selectedTilePreset: String = "Letter"
+    @State private var showingExportDialog = false
+    @State private var selectedTileForExport: TileInfo?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Tile Configuration")
+                    .font(.title)
+                Text("Subdivide large interlaced images into printable tiles, aligned to lenticule boundaries.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
+
+            Divider()
+
+            if project.interlacedImage == nil {
+                // No interlaced image yet
+                VStack(spacing: 20) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 60))
+                        .foregroundStyle(.orange)
+                    Text("No Interlaced Image")
+                        .font(.title2)
+                    Text("Generate an interlaced image first in the Interlace section.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                // Main content
+                ScrollView {
+                    VStack(spacing: 20) {
+                        // Tile Size Configuration
+                        VStack(alignment: .leading, spacing: 12) {
+                            Label("Tile Size", systemImage: "rectangle.split.2x2")
+                                .font(.headline)
+
+                            // Preset picker
+                            Picker("Preset", selection: $selectedTilePreset) {
+                                Text("Letter (8.5\" × 11\")").tag("Letter")
+                                Text("A4 (8.27\" × 11.69\")").tag("A4")
+                                Text("Square 8\" × 8\"").tag("Square8")
+                                Text("Custom").tag("Custom")
+                            }
+                            .pickerStyle(.segmented)
+                            .onChange(of: selectedTilePreset) { _, newValue in
+                                applyTilePreset(newValue)
+                            }
+
+                            // Custom size controls
+                            HStack(spacing: 16) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Width")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 4) {
+                                        TextField("Width", value: $project.tileConfiguration.tileWidth, format: .number.precision(.fractionLength(2)))
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 80)
+                                            .onChange(of: project.tileConfiguration.tileWidth) { _, _ in
+                                                selectedTilePreset = "Custom"
+                                            }
+                                        Text("in")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Height")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    HStack(spacing: 4) {
+                                        TextField("Height", value: $project.tileConfiguration.tileHeight, format: .number.precision(.fractionLength(2)))
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 80)
+                                            .onChange(of: project.tileConfiguration.tileHeight) { _, _ in
+                                                selectedTilePreset = "Custom"
+                                            }
+                                        Text("in")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                        .padding()
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+                        .padding(.top)
+
+                        // Tile Mode Configuration
+                        VStack(alignment: .leading, spacing: 12) {
+                            Label("Tile Mode", systemImage: "gearshape")
+                                .font(.headline)
+
+                            Picker("Mode", selection: $project.tileConfiguration.mode) {
+                                ForEach(TileConfiguration.TileMode.allCases, id: \.self) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            // Mode descriptions
+                            Text(tileModeDescription)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.gray.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }
+                        .padding()
+                        .background(Color.orange.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+
+                        // Generate Tiles Button
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Estimated Grid:")
+                                    .font(.subheadline)
+                                Text(estimatedGridSize)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            Button(action: {
+                                Task {
+                                    await project.generateTiles()
+                                }
+                            }) {
+                                Label("Generate Tiles", systemImage: "square.grid.3x3")
+                                    .padding(.horizontal, 20)
+                                    .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(project.isProcessing)
+                        }
+                        .padding()
+                        .background(Color.gray.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .padding(.horizontal)
+
+                        // Progress indicator
+                        if project.isProcessing {
+                            VStack(spacing: 12) {
+                                ProgressView(value: project.processingProgress)
+                                    .progressViewStyle(.linear)
+                                Text("Generating tiles: \(Int(project.processingProgress * 100))%")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal)
+                        }
+
+                        // Tiles Grid Preview
+                        if !project.tiles.isEmpty {
+                            VStack(alignment: .leading, spacing: 12) {
+                                HStack {
+                                    Label("\(project.tiles.count) Tiles Generated", systemImage: "checkmark.circle.fill")
+                                        .font(.headline)
+                                        .foregroundStyle(.green)
+
+                                    Spacer()
+
+                                    Button(action: { exportAllTiles() }) {
+                                        Label("Export All Tiles", systemImage: "square.and.arrow.up")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+                                .padding(.horizontal)
+
+                                // Tile grid
+                                ScrollView {
+                                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 16)], spacing: 16) {
+                                        ForEach(project.tiles) { tile in
+                                            TileThumbnailView(
+                                                tile: tile,
+                                                onExport: { exportSingleTile(tile) }
+                                            )
+                                        }
+                                    }
+                                    .padding(.horizontal)
+                                }
+                                .frame(maxHeight: 400)
+                            }
+                            .padding(.vertical)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var tileModeDescription: String {
+        switch project.tileConfiguration.mode {
+        case .edgeToEdge:
+            return "Tiles with no overlap or bleed. Requires precise manual alignment when assembling."
+        case .withBleed:
+            return "Tiles extend slightly beyond edges for trimming after assembly. Easier alignment but requires cutting."
+        case .withRegistration:
+            return "Tiles include corner crosshairs and tile numbers for easy alignment during assembly."
+        }
+    }
+
+    private var estimatedGridSize: String {
+        guard let image = project.interlacedImage,
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return "Unknown"
+        }
+
+        let imageWidth = cgImage.width
+        let imageHeight = cgImage.height
+
+        // Calculate pixels per lenticule
+        let pixelsPerLenticule = Double(project.outputDPI) / project.lensParameters.lpi
+
+        // Calculate tile dimensions in pixels
+        var tileWidthPixels = Int(project.tileConfiguration.tileWidth * Double(project.outputDPI))
+        let tileHeightPixels = Int(project.tileConfiguration.tileHeight * Double(project.outputDPI))
+
+        // Align to lenticule boundaries
+        let lenticulesPerTile = floor(Double(tileWidthPixels) / pixelsPerLenticule)
+        tileWidthPixels = Int(lenticulesPerTile * pixelsPerLenticule)
+
+        let cols = Int(ceil(Double(imageWidth) / Double(tileWidthPixels)))
+        let rows = Int(ceil(Double(imageHeight) / Double(tileHeightPixels)))
+
+        return "\(rows) rows × \(cols) columns = \(rows * cols) tiles"
+    }
+
+    private func applyTilePreset(_ preset: String) {
+        switch preset {
+        case "Letter":
+            project.tileConfiguration = .letter
+        case "A4":
+            project.tileConfiguration = .a4
+        case "Square8":
+            project.tileConfiguration = .square8
+        default:
+            break
+        }
+    }
+
+    private func exportSingleTile(_ tile: TileInfo) {
+        guard let image = tile.image else { return }
+
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.png]
+        savePanel.canCreateDirectories = true
+        savePanel.nameFieldStringValue = tile.filename(projectName: project.name)
+        savePanel.title = "Export Tile"
+
+        let response = savePanel.runModal()
+        guard response == .OK, let url = savePanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+            guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else { return }
+
+            do {
+                try pngData.write(to: url)
+                print("✅ Exported tile to: \(url.path)")
+            } catch {
+                print("❌ Export error: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func exportAllTiles() {
+        let openPanel = NSOpenPanel()
+        openPanel.canChooseFiles = false
+        openPanel.canChooseDirectories = true
+        openPanel.canCreateDirectories = true
+        openPanel.title = "Choose Export Folder"
+        openPanel.message = "Select a folder to export all tiles"
+
+        let response = openPanel.runModal()
+        guard response == .OK, let folderURL = openPanel.url else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for tile in project.tiles {
+                guard let image = tile.image else { continue }
+                guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
+
+                let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+                guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else { continue }
+
+                let fileURL = folderURL.appendingPathComponent(tile.filename(projectName: project.name))
+
+                do {
+                    try pngData.write(to: fileURL)
+                    print("✅ Exported: \(tile.name)")
+                } catch {
+                    print("❌ Failed to export \(tile.name): \(error.localizedDescription)")
+                }
+            }
+
+            print("✅ All tiles exported to: \(folderURL.path)")
+        }
+    }
+}
+
+// MARK: - Tile Thumbnail View
+
+struct TileThumbnailView: View {
+    let tile: TileInfo
+    let onExport: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topTrailing) {
+                // Thumbnail
+                Group {
+                    if let image = tile.image {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    } else {
+                        Color.gray.opacity(0.3)
+                    }
+                }
+                .frame(height: 150)
+                .background(Color.gray.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                // Export button
+                Button(action: onExport) {
+                    Image(systemName: "square.and.arrow.up.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white, .blue)
+                }
+                .buttonStyle(.plain)
+                .padding(8)
+            }
+
+            // Tile info
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tile.name)
+                    .font(.caption)
+                    .fontWeight(.medium)
+
+                if let image = tile.image,
+                   let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    Text("\(cgImage.width) × \(cgImage.height) px")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(width: 200)
     }
 }
