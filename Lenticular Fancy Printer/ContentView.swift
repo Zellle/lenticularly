@@ -109,10 +109,15 @@ struct SourceImage: Identifiable {
     }
 }
 
+/// Printer margin per side (1/8 inch on each edge)
+/// Most consumer printers can't print edge-to-edge, so we reduce dimensions to account for margins
+/// Total reduction per dimension: 1/8" × 2 sides = 1/4" (0.25")
+private let kPrinterMarginPerSide: Double = 0.125
+
 /// Tile configuration
 struct TileConfiguration: Codable, Equatable {
-    var tileWidth: Double = 8.5  // inches
-    var tileHeight: Double = 11.0  // inches
+    var tileWidth: Double = 8.5 - (kPrinterMarginPerSide * 2)  // inches (8.25" to account for printer margins)
+    var tileHeight: Double = 11.0 - (kPrinterMarginPerSide * 2)  // inches (10.75" to account for printer margins)
     var mode: TileMode = .edgeToEdge
     var bleedAmount: Double = 0.125  // inches (for bleed mode)
     var showRegistrationMarks: Bool = false
@@ -123,10 +128,10 @@ struct TileConfiguration: Codable, Equatable {
         case withRegistration = "With Registration Marks"
     }
 
-    // Common presets
-    static let letter = TileConfiguration(tileWidth: 8.5, tileHeight: 11.0)
-    static let a4 = TileConfiguration(tileWidth: 8.27, tileHeight: 11.69)
-    static let square8 = TileConfiguration(tileWidth: 8.0, tileHeight: 8.0)
+    // Common presets (with printer margin compensation applied)
+    static let letter = TileConfiguration(tileWidth: 8.5 - (kPrinterMarginPerSide * 2), tileHeight: 11.0 - (kPrinterMarginPerSide * 2))
+    static let a4 = TileConfiguration(tileWidth: 8.27 - (kPrinterMarginPerSide * 2), tileHeight: 11.69 - (kPrinterMarginPerSide * 2))
+    static let square8 = TileConfiguration(tileWidth: 8.0 - (kPrinterMarginPerSide * 2), tileHeight: 8.0 - (kPrinterMarginPerSide * 2))
 }
 
 /// Layout strategy for tiling
@@ -149,8 +154,8 @@ struct PrinterBedRegion: Codable, Equatable {
 struct TileLayout: Codable, Equatable {
     var verticalBoundaries: [Double] = []  // X positions in pixels
     var horizontalBoundaries: [Double] = []  // Y positions in pixels
-    var paperWidth: Double = 8.5  // inches
-    var paperHeight: Double = 11.0  // inches
+    var paperWidth: Double = 8.5 - (kPrinterMarginPerSide * 2)  // inches (compensated for printer margins)
+    var paperHeight: Double = 11.0 - (kPrinterMarginPerSide * 2)  // inches (compensated for printer margins)
     var maxBedSize: Double = 14.0  // inches (Prusa XL with margin)
     var strategy: TileLayoutStrategy = .portraitRemainderRight
     var printerBedRegions: [PrinterBedRegion] = []  // Groups of tiles for 3D printing
@@ -161,8 +166,8 @@ struct TileLayout: Codable, Equatable {
         imageHeight: Int,
         dpi: Int,
         lpi: Double,
-        paperWidth: Double = 8.5,
-        paperHeight: Double = 11.0,
+        paperWidth: Double = 8.5 - (kPrinterMarginPerSide * 2),
+        paperHeight: Double = 11.0 - (kPrinterMarginPerSide * 2),
         maxBedSize: Double = 14.0,
         strategy: TileLayoutStrategy? = nil
     ) -> TileLayout {
@@ -409,6 +414,11 @@ struct TileLayout: Codable, Equatable {
     }
 }
 
+/// Edge direction for a tile
+enum TileEdge: String, Codable {
+    case top, bottom, left, right
+}
+
 /// Information about a single tile
 struct TileInfo: Identifiable, Equatable {
     let id = UUID()
@@ -416,17 +426,453 @@ struct TileInfo: Identifiable, Equatable {
     let col: Int
     let rect: CGRect  // Position in pixels in the full interlaced image
     var image: NSImage?  // The actual tile image data
+    let paperWidthInches: Double  // Paper size for this tile
+    let paperHeightInches: Double
+    let dpi: Int
+    let alignToMachinedEdge: Bool  // Whether to align to left edge (machined edge)
+    let joiningEdges: Set<TileEdge>  // Edges that need to align with adjacent tiles in 3D printer
+    let totalRows: Int  // Total number of rows in the tile layout
+    let totalCols: Int  // Total number of columns in the tile layout
+    let printerBedRegion: Int?  // Which printer bed region this tile belongs to (for tracking which tiles assemble together)
 
     var name: String {
         return "Tile_R\(String(format: "%02d", row + 1))_C\(String(format: "%02d", col + 1))"
+    }
+
+    /// Get the length of each edge in inches
+    var edgeLengths: [TileEdge: Double] {
+        let tileWidthInches = rect.width / CGFloat(dpi)
+        let tileHeightInches = rect.height / CGFloat(dpi)
+        return [
+            .top: Double(tileWidthInches),
+            .bottom: Double(tileWidthInches),
+            .left: Double(tileHeightInches),
+            .right: Double(tileHeightInches)
+        ]
+    }
+
+    /// Get the longest joining edge (edge that needs to align with adjacent tiles)
+    /// When edges have equal length, prioritize: top > bottom > left > right
+    var longestJoiningEdge: (edge: TileEdge, length: Double)? {
+        let lengths = edgeLengths
+        let joiningEdgeLengths = joiningEdges.compactMap { edge -> (TileEdge, Double)? in
+            guard let length = lengths[edge] else { return nil }
+            return (edge, length)
+        }
+
+        // Priority order for tie-breaking
+        let edgePriority: [TileEdge: Int] = [
+            .top: 0,
+            .bottom: 1,
+            .left: 2,
+            .right: 3
+        ]
+
+        return joiningEdgeLengths.max { lhs, rhs in
+            // First compare by length
+            if lhs.1 != rhs.1 {
+                return lhs.1 < rhs.1
+            }
+            // If lengths are equal, compare by priority (lower number = higher priority)
+            let lhsPriority = edgePriority[lhs.0] ?? 999
+            let rhsPriority = edgePriority[rhs.0] ?? 999
+            return lhsPriority > rhsPriority  // Higher priority (lower number) wins
+        }
     }
 
     func filename(projectName: String) -> String {
         return "\(projectName)_\(name).png"
     }
 
+    /// Generate paper-sized output with tile positioned for alignment
+    func paperSizedImage() -> NSImage? {
+        guard let tileImage = image else { return nil }
+
+        // CRITICAL: Get actual pixel dimensions from CGImage, not points from NSImage
+        guard let cgImage = tileImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return nil
+        }
+
+        let tileWidthPixels = cgImage.width
+        let tileHeightPixels = cgImage.height
+
+        let paperWidthPixels = Int(paperWidthInches * Double(dpi))
+        let paperHeightPixels = Int(paperHeightInches * Double(dpi))
+        let paperSize = NSSize(width: paperWidthPixels, height: paperHeightPixels)
+
+        let paperImage = NSImage(size: paperSize)
+        paperImage.lockFocus()
+
+        // Fill entire page with white
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: paperSize).fill()
+
+        // Calculate position based on alignment strategy
+        let x: CGFloat
+        let y: CGFloat
+
+        if alignToMachinedEdge {
+            // Align to left edge (machined edge) for easier alignment
+            x = 0
+            // Center vertically
+            y = (CGFloat(paperHeightPixels) - CGFloat(tileHeightPixels)) / 2
+        } else {
+            // Center both horizontally and vertically
+            x = (CGFloat(paperWidthPixels) - CGFloat(tileWidthPixels)) / 2
+            y = (CGFloat(paperHeightPixels) - CGFloat(tileHeightPixels)) / 2
+        }
+
+        // Draw tile image at calculated position
+        tileImage.draw(
+            in: NSRect(x: x, y: y, width: CGFloat(tileWidthPixels), height: CGFloat(tileHeightPixels)),
+            from: NSRect(origin: .zero, size: tileImage.size),
+            operation: .copy,
+            fraction: 1.0
+        )
+
+        paperImage.unlockFocus()
+        return paperImage
+    }
+
     // Custom Equatable implementation that ignores image comparison
     static func == (lhs: TileInfo, rhs: TileInfo) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
+/// Represents a print sheet that can contain one or more tiles
+struct PrintSheet: Identifiable, Equatable {
+    let id = UUID()
+    let tiles: [TileInfo]  // 1 or 2 tiles on this sheet
+    let paperWidthInches: Double
+    let paperHeightInches: Double
+    let dpi: Int
+
+    var name: String {
+        if tiles.count == 1 {
+            return tiles[0].name
+        } else {
+            // Multiple tiles
+            let tileNames = tiles.map { $0.name }.joined(separator: "_")
+            return "Sheet_\(tileNames)"
+        }
+    }
+
+    func filename(projectName: String) -> String {
+        if tiles.count == 1 {
+            return tiles[0].filename(projectName: projectName)
+        } else {
+            return "\(projectName)_Sheet_Combined_\(tiles.map { "R\(tiles[0].row+1)C\($0.col+1)" }.joined(separator: "_")).png"
+        }
+    }
+
+    /// Generate paper-sized sheet with tiles positioned independently
+    /// Each tile's longest printer-bed-joining edge is on a machined paper edge
+    func renderSheet() -> NSImage? {
+        guard !tiles.isEmpty else { return nil }
+
+        let paperWidthPixels = Int(paperWidthInches * Double(dpi))
+        let paperHeightPixels = Int(paperHeightInches * Double(dpi))
+        let paperSize = NSSize(width: paperWidthPixels, height: paperHeightPixels)
+
+        let sheetImage = NSImage(size: paperSize)
+        sheetImage.lockFocus()
+
+        // Fill entire page with white
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: paperSize).fill()
+
+        // Position each tile independently based on its printer-bed-joining edges
+        if tiles.count == 1 {
+            // Single tile - position based on longest joining edge
+            let tile = tiles[0]
+            guard let tileImage = tile.image else {
+                sheetImage.unlockFocus()
+                return nil
+            }
+
+            guard let cgImage = tileImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                sheetImage.unlockFocus()
+                return nil
+            }
+
+            let tileWidthPixels = cgImage.width
+            let tileHeightPixels = cgImage.height
+
+            // Position based on longest joining edge
+            let x: CGFloat
+            let y: CGFloat
+
+            if let (edge, _) = tile.longestJoiningEdge {
+                // Position with joining edge on paper edge, and also align to another edge
+                switch edge {
+                case .left:
+                    // Left joining edge → left AND bottom paper edges
+                    x = 0
+                    y = 0
+                case .right:
+                    // Right joining edge → right AND bottom paper edges
+                    x = CGFloat(paperWidthPixels - tileWidthPixels)
+                    y = 0
+                case .top:
+                    // Top joining edge → top AND left paper edges
+                    x = 0
+                    y = CGFloat(paperHeightPixels - tileHeightPixels)
+                case .bottom:
+                    // Bottom joining edge → bottom AND left paper edges
+                    x = 0
+                    y = 0
+                }
+            } else {
+                // No joining edges - align to corner (bottom-left)
+                x = 0
+                y = 0
+            }
+
+            tileImage.draw(
+                in: NSRect(x: x, y: y, width: CGFloat(tileWidthPixels), height: CGFloat(tileHeightPixels)),
+                from: NSRect(origin: .zero, size: tileImage.size),
+                operation: .copy,
+                fraction: 1.0
+            )
+        } else {
+            // Multiple tiles - position each in separate regions to avoid overlap
+            let tilePositions = layoutTilesOnSheet(
+                tiles: tiles,
+                paperWidthPixels: paperWidthPixels,
+                paperHeightPixels: paperHeightPixels
+            )
+
+            for (tile, position) in tilePositions {
+                guard let tileImage = tile.image else { continue }
+                guard let cgImage = tileImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
+
+                tileImage.draw(
+                    in: NSRect(x: position.x, y: position.y, width: CGFloat(cgImage.width), height: CGFloat(cgImage.height)),
+                    from: NSRect(origin: .zero, size: tileImage.size),
+                    operation: .copy,
+                    fraction: 1.0
+                )
+            }
+        }
+
+        sheetImage.unlockFocus()
+        return sheetImage
+    }
+
+    /// Layout multiple tiles on a sheet, ensuring no overlap
+    /// Each tile's longest joining edge is positioned on a machined edge where possible
+    private func layoutTilesOnSheet(tiles: [TileInfo], paperWidthPixels: Int, paperHeightPixels: Int) -> [(TileInfo, CGPoint)] {
+        guard tiles.count == 2 else {
+            // For now, just handle 2 tiles (most common case)
+            return tiles.enumerated().map { (index, tile) in
+                let pos = positionTileInRegion(
+                    tile: tile,
+                    regionIndex: index,
+                    totalRegions: tiles.count,
+                    paperWidthPixels: paperWidthPixels,
+                    paperHeightPixels: paperHeightPixels
+                )
+                return (tile, pos)
+            }
+        }
+
+        // For 2 tiles, determine best layout (stacked vs side-by-side)
+        let tile1 = tiles[0]
+        let tile2 = tiles[1]
+
+        guard let img1 = tile1.image?.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let img2 = tile2.image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return []
+        }
+
+        let tile1Width = Double(img1.width) / Double(dpi)
+        let tile1Height = Double(img1.height) / Double(dpi)
+        let tile2Width = Double(img2.width) / Double(dpi)
+        let tile2Height = Double(img2.height) / Double(dpi)
+
+        // Check if side-by-side fits
+        let sideBySideWidth = tile1Width + tile2Width
+        let sideBySideHeight = max(tile1Height, tile2Height)
+        let fitsHorizontal = sideBySideWidth <= paperWidthInches && sideBySideHeight <= paperHeightInches
+
+        // Check if stacked fits
+        let stackedWidth = max(tile1Width, tile2Width)
+        let stackedHeight = tile1Height + tile2Height
+        let fitsVertical = stackedWidth <= paperWidthInches && stackedHeight <= paperHeightInches
+
+        // Determine layout direction
+        let useVertical = fitsVertical // Prefer vertical (stacked) if it fits
+
+        var positions: [(TileInfo, CGPoint)] = []
+
+        if useVertical {
+            // Stack vertically: tile1 in top half, tile2 in bottom half
+            // Add margin between regions for cutting
+            let marginPixels = Int(0.25 * Double(dpi)) // 0.25 inch margin
+            let halfHeight = (paperHeightPixels - marginPixels) / 2
+
+            // Position tile1 in top half
+            let pos1 = positionTileInVerticalRegion(
+                tile: tile1,
+                isTop: true,
+                paperWidthPixels: paperWidthPixels,
+                paperHeightPixels: paperHeightPixels,
+                regionHeight: halfHeight,
+                marginPixels: marginPixels
+            )
+            positions.append((tile1, pos1))
+
+            // Position tile2 in bottom half
+            let pos2 = positionTileInVerticalRegion(
+                tile: tile2,
+                isTop: false,
+                paperWidthPixels: paperWidthPixels,
+                paperHeightPixels: paperHeightPixels,
+                regionHeight: halfHeight,
+                marginPixels: marginPixels
+            )
+            positions.append((tile2, pos2))
+        } else if fitsHorizontal {
+            // Place side-by-side: tile1 in left half, tile2 in right half
+            // Add margin between regions for cutting
+            let marginPixels = Int(0.25 * Double(dpi)) // 0.25 inch margin
+            let halfWidth = (paperWidthPixels - marginPixels) / 2
+
+            // Position tile1 in left half
+            let pos1 = positionTileInHorizontalRegion(
+                tile: tile1,
+                isLeft: true,
+                paperWidthPixels: paperWidthPixels,
+                paperHeightPixels: paperHeightPixels,
+                regionWidth: halfWidth,
+                marginPixels: marginPixels
+            )
+            positions.append((tile1, pos1))
+
+            // Position tile2 in right half
+            let pos2 = positionTileInHorizontalRegion(
+                tile: tile2,
+                isLeft: false,
+                paperWidthPixels: paperWidthPixels,
+                paperHeightPixels: paperHeightPixels,
+                regionWidth: halfWidth,
+                marginPixels: marginPixels
+            )
+            positions.append((tile2, pos2))
+        }
+
+        return positions
+    }
+
+    /// Position tile in a vertical region (top or bottom half)
+    private func positionTileInVerticalRegion(tile: TileInfo, isTop: Bool, paperWidthPixels: Int, paperHeightPixels: Int, regionHeight: Int, marginPixels: Int = 0) -> CGPoint {
+        guard let cgImage = tile.image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return CGPoint.zero
+        }
+
+        let tileWidthPixels = cgImage.width
+        let tileHeightPixels = cgImage.height
+
+        let longestJoinEdge = tile.longestJoiningEdge
+
+        let x: CGFloat
+        let y: CGFloat
+
+        // Position horizontally - align to left or right edge based on longest joining edge
+        if let (edge, _) = longestJoinEdge {
+            switch edge {
+            case .left:
+                x = 0  // Left joining edge → left paper edge
+            case .right:
+                x = CGFloat(paperWidthPixels - tileWidthPixels)  // Right joining edge → right paper edge
+            case .top, .bottom:
+                x = 0  // Vertical joining edges → default to left edge
+            }
+        } else {
+            x = 0  // No joining edges → default to left edge
+        }
+
+        // Position vertically - MUST respect region assignment to avoid overlap
+        // Top region tiles stay in top half, bottom region tiles stay in bottom half
+        if isTop {
+            // Top region - align to TOP edge only
+            y = CGFloat(paperHeightPixels - tileHeightPixels)
+        } else {
+            // Bottom region - align to BOTTOM edge only
+            y = 0
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Position tile in a horizontal region (left or right half)
+    private func positionTileInHorizontalRegion(tile: TileInfo, isLeft: Bool, paperWidthPixels: Int, paperHeightPixels: Int, regionWidth: Int, marginPixels: Int = 0) -> CGPoint {
+        guard let cgImage = tile.image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return CGPoint.zero
+        }
+
+        let tileWidthPixels = cgImage.width
+        let tileHeightPixels = cgImage.height
+
+        let longestJoinEdge = tile.longestJoiningEdge
+
+        let x: CGFloat
+        let y: CGFloat
+
+        // Position vertically - align to top or bottom edge based on longest joining edge
+        if let (edge, _) = longestJoinEdge {
+            switch edge {
+            case .top:
+                y = CGFloat(paperHeightPixels - tileHeightPixels)  // Top joining edge → top paper edge
+            case .bottom:
+                y = 0  // Bottom joining edge → bottom paper edge
+            case .left, .right:
+                y = 0  // Horizontal joining edges → default to bottom edge
+            }
+        } else {
+            y = 0  // No joining edges → default to bottom edge
+        }
+
+        // Position horizontally - MUST respect region assignment to avoid overlap
+        // Left region tiles stay in left half, right region tiles stay in right half
+        if isLeft {
+            // Left region - align to LEFT edge only
+            x = 0
+        } else {
+            // Right region - align to RIGHT edge only
+            x = CGFloat(paperWidthPixels - tileWidthPixels)
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Position tile in a generic region (for more than 2 tiles)
+    private func positionTileInRegion(tile: TileInfo, regionIndex: Int, totalRegions: Int, paperWidthPixels: Int, paperHeightPixels: Int) -> CGPoint {
+        guard let cgImage = tile.image?.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            return CGPoint.zero
+        }
+
+        let tileWidthPixels = cgImage.width
+        let tileHeightPixels = cgImage.height
+
+        // Simple grid layout for multiple tiles
+        let cols = totalRegions <= 2 ? totalRegions : 2
+        let rows = (totalRegions + cols - 1) / cols
+
+        let col = regionIndex % cols
+        let row = regionIndex / cols
+
+        let regionWidth = paperWidthPixels / cols
+        let regionHeight = paperHeightPixels / rows
+
+        let x = CGFloat(col * regionWidth + (regionWidth - tileWidthPixels) / 2)
+        let y = CGFloat(row * regionHeight + (regionHeight - tileHeightPixels) / 2)
+
+        return CGPoint(x: x, y: y)
+    }
+
+    static func == (lhs: PrintSheet, rhs: PrintSheet) -> Bool {
         return lhs.id == rhs.id
     }
 }
@@ -485,6 +931,7 @@ class Project: ObservableObject {
     @Published var tileConfiguration = TileConfiguration()
     @Published var tileLayout: TileLayout?
     @Published var tiles: [TileInfo] = []
+    @Published var printSheets: [PrintSheet] = []  // Grouped sheets for printing
     @Published var lensModel: MDLAsset?
     @Published var lensTiles: [LensTileInfo] = []
 
@@ -673,9 +1120,169 @@ class Project: ObservableObject {
 
         await MainActor.run {
             tiles = result
+            // Group tiles into print sheets
+            printSheets = groupTilesIntoSheets(tiles: result)
             isProcessing = false
             processingProgress = 1.0
         }
+    }
+
+    /// Group tiles into print sheets - each tile gets its own full page
+    /// Ensures longest joining edges are aligned to machined paper edges
+    func groupTilesIntoSheets(tiles: [TileInfo]) -> [PrintSheet] {
+        var sheets: [PrintSheet] = []
+
+        // Determine paper size from tile configuration or layout
+        let paperWidth: Double
+        let paperHeight: Double
+
+        if let layout = tileLayout {
+            let isPortrait = layout.strategy == .portraitRemainderRight || layout.strategy == .portraitRemainderLeft
+            paperWidth = isPortrait ? layout.paperWidth : layout.paperHeight
+            paperHeight = isPortrait ? layout.paperHeight : layout.paperWidth
+        } else {
+            paperWidth = tileConfiguration.tileWidth
+            paperHeight = tileConfiguration.tileHeight
+        }
+
+        // Give each tile its own full page
+        for tile in tiles {
+            let sheet = PrintSheet(
+                tiles: [tile],
+                paperWidthInches: paperWidth,
+                paperHeightInches: paperHeight,
+                dpi: tile.dpi
+            )
+            sheets.append(sheet)
+        }
+
+        return sheets
+    }
+
+    /// Find the best pair of remnants to combine on one sheet
+    /// Prioritizes placing longest joining edges on machined (paper) edges
+    private func findBestRemnantPair(
+        remnants: [TileInfo],
+        paperWidth: Double,
+        paperHeight: Double
+    ) -> (TileInfo, TileInfo)? {
+        guard remnants.count >= 2 else { return nil }
+
+        var bestPair: (TileInfo, TileInfo)?
+        var bestScore: Double = -Double.infinity
+
+        // Try all possible pairs
+        for i in 0..<remnants.count {
+            for j in (i+1)..<remnants.count {
+                let tile1 = remnants[i]
+                let tile2 = remnants[j]
+
+                // Calculate score for this pairing
+                let score = scorePairFit(
+                    tile1: tile1,
+                    tile2: tile2,
+                    paperWidth: paperWidth,
+                    paperHeight: paperHeight
+                )
+
+                if score > bestScore {
+                    bestScore = score
+                    bestPair = (tile1, tile2)
+                }
+            }
+        }
+
+        // Only return a pair if the score is positive (fit is good)
+        if bestScore > 0 {
+            return bestPair
+        }
+        return nil
+    }
+
+    /// Score how well two tiles fit together on one sheet
+    /// Higher score = better fit
+    /// Key criterion: longest joining edge should be on a machined edge
+    private func scorePairFit(
+        tile1: TileInfo,
+        tile2: TileInfo,
+        paperWidth: Double,
+        paperHeight: Double
+    ) -> Double {
+        let tile1Width = tile1.rect.width / CGFloat(tile1.dpi)
+        let tile1Height = tile1.rect.height / CGFloat(tile1.dpi)
+        let tile2Width = tile2.rect.width / CGFloat(tile2.dpi)
+        let tile2Height = tile2.rect.height / CGFloat(tile2.dpi)
+
+        var score: Double = 0
+
+        // Check if they fit side-by-side (landscape orientation)
+        let sideBySideWidth = Double(tile1Width + tile2Width)
+        let sideBySideHeight = max(Double(tile1Height), Double(tile2Height))
+        let fitsLandscape = sideBySideWidth <= paperWidth && sideBySideHeight <= paperHeight
+
+        // Check if they fit stacked (portrait orientation)
+        let stackedWidth = max(Double(tile1Width), Double(tile2Width))
+        let stackedHeight = Double(tile1Height + tile2Height)
+        let fitsPortrait = stackedWidth <= paperWidth && stackedHeight <= paperHeight
+
+        if !fitsLandscape && !fitsPortrait {
+            return -1000  // Doesn't fit at all
+        }
+
+        // Score based on longest joining edge placement
+        // Best: longest joining edge on a machined edge (paper edge)
+
+        if fitsLandscape {
+            // In landscape: left and right edges are machined edges
+            let tile1LongestJoin = tile1.longestJoiningEdge
+            let tile2LongestJoin = tile2.longestJoiningEdge
+
+            var landscapeScore: Double = 100  // Base score for fitting
+
+            // Bonus if tile1's longest joining edge would be on left edge
+            if let (edge, length) = tile1LongestJoin, edge == .left {
+                landscapeScore += length * 10
+            }
+
+            // Bonus if tile2's longest joining edge would be on right edge
+            if let (edge, length) = tile2LongestJoin, edge == .right {
+                landscapeScore += length * 10
+            }
+
+            // Efficiency bonus: use more of the paper
+            let areaUsed = sideBySideWidth * sideBySideHeight
+            let paperArea = paperWidth * paperHeight
+            landscapeScore += (areaUsed / paperArea) * 50
+
+            score = max(score, landscapeScore)
+        }
+
+        if fitsPortrait {
+            // In portrait: top and bottom edges are machined edges
+            let tile1LongestJoin = tile1.longestJoiningEdge
+            let tile2LongestJoin = tile2.longestJoiningEdge
+
+            var portraitScore: Double = 100  // Base score for fitting
+
+            // Bonus if tile1's longest joining edge would be on top edge
+            if let (edge, length) = tile1LongestJoin, edge == .top {
+                portraitScore += length * 10
+            }
+
+            // Bonus if tile2's longest joining edge would be on bottom edge
+            if let (edge, length) = tile2LongestJoin, edge == .bottom {
+                portraitScore += length * 10
+            }
+
+            // Efficiency bonus: use more of the paper
+            let areaUsed = stackedWidth * stackedHeight
+            let paperArea = paperWidth * paperHeight
+            portraitScore += (areaUsed / paperArea) * 50
+
+            score = max(score, portraitScore)
+        }
+
+        return score
     }
 
     // MARK: - 3D Model Generation
@@ -1041,11 +1648,107 @@ class TileGenerator {
                             finalImage = tileImage
                         }
 
+                        // Determine paper size for this tile
+                        let tileWidthInches = Double(width) / Double(dpi)
+                        let tileHeightInches = Double(height) / Double(dpi)
+
+                        // Determine paper orientation based on layout strategy
+                        let isPortrait = layout.strategy == .portraitRemainderRight || layout.strategy == .portraitRemainderLeft
+                        let basePaperWidth = isPortrait ? layout.paperWidth : layout.paperHeight
+                        let basePaperHeight = isPortrait ? layout.paperHeight : layout.paperWidth
+
+                        // Always use full paper size for output (for "fill page" printing)
+                        let paperWidth = basePaperWidth
+                        let paperHeight = basePaperHeight
+
+                        // Align to machined edge if tile is smaller than paper
+                        let alignToEdge = tileWidthInches < basePaperWidth
+
+                        let totalRows = yBoundaries.count - 1
+                        let totalCols = xBoundaries.count - 1
+
+                        // Determine which printer bed region this tile belongs to
+                        var bedRegion: Int? = nil
+                        for (index, region) in layout.printerBedRegions.enumerated() {
+                            if col >= region.columnStart && col < region.columnEnd &&
+                               row >= region.rowStart && row < region.rowEnd {
+                                bedRegion = index
+                                break
+                            }
+                        }
+
+                        // Calculate joining edges (edges that connect to other tiles WITHIN THE SAME PRINTER BED)
+                        var joiningEdges: Set<TileEdge> = []
+
+                        // Top edge joins if there's a tile above IN THE SAME PRINTER BED
+                        if row > 0 {
+                            let adjacentRow = row - 1
+                            var adjacentInSameBed = false
+                            if let currentBed = bedRegion {
+                                let region = layout.printerBedRegions[currentBed]
+                                adjacentInSameBed = (adjacentRow >= region.rowStart && adjacentRow < region.rowEnd &&
+                                                    col >= region.columnStart && col < region.columnEnd)
+                            }
+                            if adjacentInSameBed {
+                                joiningEdges.insert(.top)
+                            }
+                        }
+
+                        // Bottom edge joins if there's a tile below IN THE SAME PRINTER BED
+                        if row < totalRows - 1 {
+                            let adjacentRow = row + 1
+                            var adjacentInSameBed = false
+                            if let currentBed = bedRegion {
+                                let region = layout.printerBedRegions[currentBed]
+                                adjacentInSameBed = (adjacentRow >= region.rowStart && adjacentRow < region.rowEnd &&
+                                                    col >= region.columnStart && col < region.columnEnd)
+                            }
+                            if adjacentInSameBed {
+                                joiningEdges.insert(.bottom)
+                            }
+                        }
+
+                        // Left edge joins if there's a tile to the left IN THE SAME PRINTER BED
+                        if col > 0 {
+                            let adjacentCol = col - 1
+                            var adjacentInSameBed = false
+                            if let currentBed = bedRegion {
+                                let region = layout.printerBedRegions[currentBed]
+                                adjacentInSameBed = (row >= region.rowStart && row < region.rowEnd &&
+                                                    adjacentCol >= region.columnStart && adjacentCol < region.columnEnd)
+                            }
+                            if adjacentInSameBed {
+                                joiningEdges.insert(.left)
+                            }
+                        }
+
+                        // Right edge joins if there's a tile to the right IN THE SAME PRINTER BED
+                        if col < totalCols - 1 {
+                            let adjacentCol = col + 1
+                            var adjacentInSameBed = false
+                            if let currentBed = bedRegion {
+                                let region = layout.printerBedRegions[currentBed]
+                                adjacentInSameBed = (row >= region.rowStart && row < region.rowEnd &&
+                                                    adjacentCol >= region.columnStart && adjacentCol < region.columnEnd)
+                            }
+                            if adjacentInSameBed {
+                                joiningEdges.insert(.right)
+                            }
+                        }
+
                         let tileInfo = TileInfo(
                             row: row,
                             col: col,
                             rect: rect,
-                            image: finalImage
+                            image: finalImage,
+                            paperWidthInches: paperWidth,
+                            paperHeightInches: paperHeight,
+                            dpi: dpi,
+                            alignToMachinedEdge: alignToEdge,
+                            joiningEdges: joiningEdges,
+                            totalRows: totalRows,
+                            totalCols: totalCols,
+                            printerBedRegion: bedRegion
                         )
                         tiles.append(tileInfo)
                     }
@@ -1099,11 +1802,56 @@ class TileGenerator {
                             finalImage = tileImage
                         }
 
+                        // Determine paper size for this tile
+                        let tileWidthInches = Double(width) / Double(dpi)
+                        let tileHeightInches = Double(height) / Double(dpi)
+
+                        // Determine paper orientation based on tile aspect ratio
+                        // If tile is wider than tall, use landscape; otherwise portrait
+                        let tileIsLandscape = tileWidthInches > tileHeightInches
+                        let basePaperWidth = tileIsLandscape ? max(config.tileWidth, config.tileHeight) : min(config.tileWidth, config.tileHeight)
+                        let basePaperHeight = tileIsLandscape ? min(config.tileWidth, config.tileHeight) : max(config.tileWidth, config.tileHeight)
+
+                        // Always use full paper size for output (for "fill page" printing)
+                        let paperWidth = basePaperWidth
+                        let paperHeight = basePaperHeight
+
+                        // Align to machined edge if tile is smaller than paper
+                        let alignToEdge = tileWidthInches < basePaperWidth
+
+                        // Calculate joining edges (edges that connect to other tiles)
+                        var joiningEdges: Set<TileEdge> = []
+
+                        // Top edge joins if there's a tile above
+                        if row > 0 {
+                            joiningEdges.insert(.top)
+                        }
+                        // Bottom edge joins if there's a tile below
+                        if row < rows - 1 {
+                            joiningEdges.insert(.bottom)
+                        }
+                        // Left edge joins if there's a tile to the left
+                        if col > 0 {
+                            joiningEdges.insert(.left)
+                        }
+                        // Right edge joins if there's a tile to the right
+                        if col < cols - 1 {
+                            joiningEdges.insert(.right)
+                        }
+
                         let tileInfo = TileInfo(
                             row: row,
                             col: col,
                             rect: rect,
-                            image: finalImage
+                            image: finalImage,
+                            paperWidthInches: paperWidth,
+                            paperHeightInches: paperHeight,
+                            dpi: dpi,
+                            alignToMachinedEdge: alignToEdge,
+                            joiningEdges: joiningEdges,
+                            totalRows: rows,
+                            totalCols: cols,
+                            printerBedRegion: nil  // Uniform grid doesn't use bed regions
                         )
                         tiles.append(tileInfo)
                     }
@@ -3213,31 +3961,31 @@ struct TilingView: View {
                             .padding(.horizontal)
                         }
 
-                        // Tiles Grid Preview
-                        if !project.tiles.isEmpty {
+                        // Print Sheets Preview
+                        if !project.printSheets.isEmpty {
                             VStack(alignment: .leading, spacing: 12) {
                                 HStack {
-                                    Label("\(project.tiles.count) Tiles Generated", systemImage: "checkmark.circle.fill")
+                                    Label("\(project.printSheets.count) Print Sheets Generated", systemImage: "checkmark.circle.fill")
                                         .font(.headline)
                                         .foregroundStyle(.green)
 
                                     Spacer()
 
-                                    Button(action: { exportAllTiles() }) {
-                                        Label("Export All Tiles", systemImage: "square.and.arrow.up")
+                                    Button(action: { exportAllSheets() }) {
+                                        Label("Export All Sheets", systemImage: "square.and.arrow.up")
                                             .font(.caption)
                                     }
                                     .buttonStyle(.borderedProminent)
                                 }
                                 .padding(.horizontal)
 
-                                // Tile grid
+                                // Print sheets grid
                                 ScrollView {
                                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 16)], spacing: 16) {
-                                        ForEach(project.tiles) { tile in
-                                            TileThumbnailView(
-                                                tile: tile,
-                                                onExport: { exportSingleTile(tile) }
+                                        ForEach(project.printSheets) { sheet in
+                                            PrintSheetThumbnailView(
+                                                sheet: sheet,
+                                                onExport: { exportSingleSheet(sheet) }
                                             )
                                         }
                                     }
@@ -3303,62 +4051,86 @@ struct TilingView: View {
         }
     }
 
-    private func exportSingleTile(_ tile: TileInfo) {
-        guard let image = tile.image else { return }
+    private func exportSingleSheet(_ sheet: PrintSheet) {
+        // Generate sheet image with tiles positioned
+        guard let sheetImage = sheet.renderSheet() else { return }
 
         let savePanel = NSSavePanel()
         savePanel.allowedContentTypes = [.png]
         savePanel.canCreateDirectories = true
-        savePanel.nameFieldStringValue = tile.filename(projectName: project.name)
-        savePanel.title = "Export Tile"
+        savePanel.nameFieldStringValue = sheet.filename(projectName: project.name)
+        savePanel.title = "Export Print Sheet"
 
         let response = savePanel.runModal()
         guard response == .OK, let url = savePanel.url else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            guard let cgImage = sheetImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
             let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+
+            // Set the physical size to get correct DPI in the exported PNG
+            bitmapRep.size = NSSize(
+                width: sheet.paperWidthInches * 72.0,  // Convert to points (72 points per inch)
+                height: sheet.paperHeightInches * 72.0
+            )
+
             guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else { return }
 
             do {
                 try pngData.write(to: url)
-                print("✅ Exported tile to: \(url.path)")
+                if sheet.tiles.count > 1 {
+                    print("✅ Exported combined sheet to: \(url.path)")
+                } else {
+                    print("✅ Exported sheet to: \(url.path)")
+                }
             } catch {
                 print("❌ Export error: \(error.localizedDescription)")
             }
         }
     }
 
-    private func exportAllTiles() {
+    private func exportAllSheets() {
         let openPanel = NSOpenPanel()
         openPanel.canChooseFiles = false
         openPanel.canChooseDirectories = true
         openPanel.canCreateDirectories = true
         openPanel.title = "Choose Export Folder"
-        openPanel.message = "Select a folder to export all tiles"
+        openPanel.message = "Select a folder to export all print sheets"
 
         let response = openPanel.runModal()
         guard response == .OK, let folderURL = openPanel.url else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            for tile in project.tiles {
-                guard let image = tile.image else { continue }
-                guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
+            for (index, sheet) in project.printSheets.enumerated() {
+                // Generate sheet image
+                guard let sheetImage = sheet.renderSheet() else { continue }
+                guard let cgImage = sheetImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else { continue }
 
                 let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+
+                // Set the physical size to get correct DPI in the exported PNG
+                bitmapRep.size = NSSize(
+                    width: sheet.paperWidthInches * 72.0,  // Convert to points (72 points per inch)
+                    height: sheet.paperHeightInches * 72.0
+                )
+
                 guard let pngData = bitmapRep.representation(using: .png, properties: [:]) else { continue }
 
-                let fileURL = folderURL.appendingPathComponent(tile.filename(projectName: project.name))
+                let fileURL = folderURL.appendingPathComponent(sheet.filename(projectName: project.name))
 
                 do {
                     try pngData.write(to: fileURL)
-                    print("✅ Exported: \(tile.name)")
+                    if sheet.tiles.count > 1 {
+                        print("✅ Exported combined sheet \(index + 1): \(sheet.tiles.map { $0.name }.joined(separator: " + "))")
+                    } else {
+                        print("✅ Exported sheet \(index + 1): \(sheet.name)")
+                    }
                 } catch {
-                    print("❌ Failed to export \(tile.name): \(error.localizedDescription)")
+                    print("❌ Failed to export sheet \(index + 1): \(error.localizedDescription)")
                 }
             }
 
-            print("✅ All tiles exported to: \(folderURL.path)")
+            print("✅ All print sheets exported to: \(folderURL.path)")
         }
     }
 }
@@ -3408,6 +4180,64 @@ struct TileThumbnailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+            }
+        }
+        .frame(width: 200)
+    }
+}
+
+// MARK: - Print Sheet Thumbnail View
+
+struct PrintSheetThumbnailView: View {
+    let sheet: PrintSheet
+    let onExport: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topTrailing) {
+                // Thumbnail - render the sheet
+                Group {
+                    if let sheetImage = sheet.renderSheet() {
+                        Image(nsImage: sheetImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    } else {
+                        Color.gray.opacity(0.3)
+                    }
+                }
+                .frame(height: 150)
+                .background(Color.gray.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                // Export button
+                Button(action: onExport) {
+                    Image(systemName: "square.and.arrow.up.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.white, .blue)
+                }
+                .buttonStyle(.plain)
+                .padding(8)
+            }
+
+            // Sheet info
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sheet.name)
+                    .font(.caption)
+                    .fontWeight(.medium)
+
+                if sheet.tiles.count == 1 {
+                    Text("Single tile")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(sheet.tiles.count) tiles combined")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("\(Int(sheet.paperWidthInches * 100) / 100)\" × \(Int(sheet.paperHeightInches * 100) / 100)\" @ \(sheet.dpi) DPI")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(width: 200)
