@@ -1999,14 +1999,21 @@ class LensModelGenerator {
         let segmentsAround = 24  // Resolution around the cylinder arc
         let segmentsAlong = 2    // Just 2 segments along the length (start and end)
 
+        // Store first and last lenticule vertex rings for end caps
+        var firstLenticuleVertices: [[SIMD3<Float>]] = []
+        var lastLenticuleVertices: [[SIMD3<Float>]] = []
+
         for i in 0..<numLenticules {
             let xStart = Float(i) * Float(lensParameters.pitch)
 
             // Generate vertices for this lenticule (half-cylinder)
             let baseIndexOffset = UInt32(allVertices.count)
 
+            var lenticuleVertexRings: [[SIMD3<Float>]] = []
+
             for segAlong in 0...segmentsAlong {
                 let z = Float(segAlong) * Float(heightMM) / Float(segmentsAlong)
+                var ring: [SIMD3<Float>] = []
 
                 for segAround in 0...segmentsAround {
                     // Angle from -π/2 to π/2 (half cylinder facing up)
@@ -2015,12 +2022,23 @@ class LensModelGenerator {
                     let x = xStart + Float(lensParameters.pitch / 2.0) + Float(lensParameters.radius) * sin(angle)
                     let y = Float(lensParameters.radius) * cos(angle) - Float(lensParameters.radius) + Float(lensParameters.height)
 
-                    allVertices.append(SIMD3(x, y, z))
+                    let vertex = SIMD3(x, y, z)
+                    allVertices.append(vertex)
+                    ring.append(vertex)
 
                     // Normal for curved surface
                     let normal = SIMD3(sin(angle), cos(angle), 0)
                     allNormals.append(normalize(normal))
                 }
+                lenticuleVertexRings.append(ring)
+            }
+
+            // Store first and last lenticule vertices for end caps
+            if i == 0 {
+                firstLenticuleVertices = lenticuleVertexRings
+            }
+            if i == numLenticules - 1 {
+                lastLenticuleVertices = lenticuleVertexRings
             }
 
             // Generate triangle indices for this lenticule
@@ -2048,29 +2066,173 @@ class LensModelGenerator {
 
         progressCallback(0.8)
 
-        // Add flat base plate
-        let baseY = Float(0)
-        let baseVertexOffset = UInt32(allVertices.count)
+        // Create solid backing block
+        // The block extends from y=0 (bottom) to the base of the lenticules
+        let blockThickness = Float(lensParameters.height) - Float(lensParameters.radius)
+        let blockBottom = Float(0)
+        let blockTop = blockThickness
 
-        // Base corners
-        let baseCorners: [SIMD3<Float>] = [
-            SIMD3(0, baseY, 0),
-            SIMD3(Float(widthMM), baseY, 0),
-            SIMD3(Float(widthMM), baseY, Float(heightMM)),
-            SIMD3(0, baseY, Float(heightMM))
+        // BOTTOM FACE (flat base at y=0)
+        let bottomVertexOffset = UInt32(allVertices.count)
+        let bottomCorners: [SIMD3<Float>] = [
+            SIMD3(0, blockBottom, 0),
+            SIMD3(Float(widthMM), blockBottom, 0),
+            SIMD3(Float(widthMM), blockBottom, Float(heightMM)),
+            SIMD3(0, blockBottom, Float(heightMM))
         ]
-
-        allVertices.append(contentsOf: baseCorners)
-        let baseNormal = SIMD3<Float>(0, -1, 0)
+        allVertices.append(contentsOf: bottomCorners)
+        let bottomNormal = SIMD3<Float>(0, -1, 0)
         for _ in 0..<4 {
-            allNormals.append(baseNormal)
+            allNormals.append(bottomNormal)
+        }
+        allIndices.append(contentsOf: [
+            bottomVertexOffset, bottomVertexOffset + 1, bottomVertexOffset + 2,
+            bottomVertexOffset, bottomVertexOffset + 2, bottomVertexOffset + 3
+        ])
+
+        // TOP FACE (connecting to lenticules)
+        let topVertexOffset = UInt32(allVertices.count)
+        let topCorners: [SIMD3<Float>] = [
+            SIMD3(0, blockTop, 0),
+            SIMD3(Float(widthMM), blockTop, 0),
+            SIMD3(Float(widthMM), blockTop, Float(heightMM)),
+            SIMD3(0, blockTop, Float(heightMM))
+        ]
+        allVertices.append(contentsOf: topCorners)
+        let topNormal = SIMD3<Float>(0, 1, 0)
+        for _ in 0..<4 {
+            allNormals.append(topNormal)
+        }
+        allIndices.append(contentsOf: [
+            topVertexOffset, topVertexOffset + 2, topVertexOffset + 1,
+            topVertexOffset, topVertexOffset + 3, topVertexOffset + 2
+        ])
+
+        // FRONT FACE (z=0)
+        let frontVertexOffset = UInt32(allVertices.count)
+        let frontVerts: [SIMD3<Float>] = [
+            SIMD3(0, blockBottom, 0),
+            SIMD3(Float(widthMM), blockBottom, 0),
+            SIMD3(Float(widthMM), blockTop, 0),
+            SIMD3(0, blockTop, 0)
+        ]
+        allVertices.append(contentsOf: frontVerts)
+        let frontNormal = SIMD3<Float>(0, 0, -1)
+        for _ in 0..<4 {
+            allNormals.append(frontNormal)
+        }
+        allIndices.append(contentsOf: [
+            frontVertexOffset, frontVertexOffset + 1, frontVertexOffset + 2,
+            frontVertexOffset, frontVertexOffset + 2, frontVertexOffset + 3
+        ])
+
+        // BACK FACE (z=heightMM)
+        let backVertexOffset = UInt32(allVertices.count)
+        let backVerts: [SIMD3<Float>] = [
+            SIMD3(0, blockBottom, Float(heightMM)),
+            SIMD3(Float(widthMM), blockBottom, Float(heightMM)),
+            SIMD3(Float(widthMM), blockTop, Float(heightMM)),
+            SIMD3(0, blockTop, Float(heightMM))
+        ]
+        allVertices.append(contentsOf: backVerts)
+        let backNormal = SIMD3<Float>(0, 0, 1)
+        for _ in 0..<4 {
+            allNormals.append(backNormal)
+        }
+        allIndices.append(contentsOf: [
+            backVertexOffset, backVertexOffset + 2, backVertexOffset + 1,
+            backVertexOffset, backVertexOffset + 3, backVertexOffset + 2
+        ])
+
+        // LEFT FACE (x=0)
+        let leftVertexOffset = UInt32(allVertices.count)
+        let leftVerts: [SIMD3<Float>] = [
+            SIMD3(0, blockBottom, 0),
+            SIMD3(0, blockBottom, Float(heightMM)),
+            SIMD3(0, blockTop, Float(heightMM)),
+            SIMD3(0, blockTop, 0)
+        ]
+        allVertices.append(contentsOf: leftVerts)
+        let leftNormal = SIMD3<Float>(-1, 0, 0)
+        for _ in 0..<4 {
+            allNormals.append(leftNormal)
+        }
+        allIndices.append(contentsOf: [
+            leftVertexOffset, leftVertexOffset + 1, leftVertexOffset + 2,
+            leftVertexOffset, leftVertexOffset + 2, leftVertexOffset + 3
+        ])
+
+        // RIGHT FACE (x=widthMM)
+        let rightVertexOffset = UInt32(allVertices.count)
+        let rightVerts: [SIMD3<Float>] = [
+            SIMD3(Float(widthMM), blockBottom, 0),
+            SIMD3(Float(widthMM), blockBottom, Float(heightMM)),
+            SIMD3(Float(widthMM), blockTop, Float(heightMM)),
+            SIMD3(Float(widthMM), blockTop, 0)
+        ]
+        allVertices.append(contentsOf: rightVerts)
+        let rightNormal = SIMD3<Float>(1, 0, 0)
+        for _ in 0..<4 {
+            allNormals.append(rightNormal)
+        }
+        allIndices.append(contentsOf: [
+            rightVertexOffset, rightVertexOffset + 2, rightVertexOffset + 1,
+            rightVertexOffset, rightVertexOffset + 3, rightVertexOffset + 2
+        ])
+
+        // LEFT END CAP (closes the left side of the first lenticule)
+        // Connect the first lenticule arc to the left wall
+        if !firstLenticuleVertices.isEmpty {
+            let leftCapVertexOffset = UInt32(allVertices.count)
+
+            // Add vertices for the left end cap (at z=0)
+            let frontRing = firstLenticuleVertices[0]
+            for vertex in frontRing {
+                allVertices.append(vertex)
+                allNormals.append(SIMD3<Float>(0, 0, -1))  // Normal pointing left
+            }
+
+            // Create triangles connecting each segment to the origin
+            let centerVertex = SIMD3<Float>(frontRing.first!.x, blockTop, 0)
+            let centerIndex = UInt32(allVertices.count)
+            allVertices.append(centerVertex)
+            allNormals.append(SIMD3<Float>(0, 0, -1))
+
+            for j in 0..<(frontRing.count - 1) {
+                allIndices.append(contentsOf: [
+                    leftCapVertexOffset + UInt32(j),
+                    centerIndex,
+                    leftCapVertexOffset + UInt32(j + 1)
+                ])
+            }
         }
 
-        // Base triangles
-        allIndices.append(contentsOf: [
-            baseVertexOffset, baseVertexOffset + 1, baseVertexOffset + 2,
-            baseVertexOffset, baseVertexOffset + 2, baseVertexOffset + 3
-        ])
+        // RIGHT END CAP (closes the right side of the last lenticule)
+        // Connect the last lenticule arc to the right wall
+        if !lastLenticuleVertices.isEmpty {
+            let rightCapVertexOffset = UInt32(allVertices.count)
+
+            // Add vertices for the right end cap (at z=heightMM)
+            let backRing = lastLenticuleVertices[lastLenticuleVertices.count - 1]
+            for vertex in backRing {
+                allVertices.append(vertex)
+                allNormals.append(SIMD3<Float>(0, 0, 1))  // Normal pointing right
+            }
+
+            // Create triangles connecting each segment to the origin
+            let centerVertex = SIMD3<Float>(backRing.first!.x, blockTop, Float(heightMM))
+            let centerIndex = UInt32(allVertices.count)
+            allVertices.append(centerVertex)
+            allNormals.append(SIMD3<Float>(0, 0, 1))
+
+            for j in 0..<(backRing.count - 1) {
+                allIndices.append(contentsOf: [
+                    rightCapVertexOffset + UInt32(j + 1),
+                    centerIndex,
+                    rightCapVertexOffset + UInt32(j)
+                ])
+            }
+        }
 
         progressCallback(0.9)
 
